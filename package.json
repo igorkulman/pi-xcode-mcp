@@ -1,0 +1,58 @@
+{
+  "name": "pi-xcode-mcp",
+  "version": "0.1.0",
+  "description": "Pi package that connects Pi to Xcode's built-in MCP server and exposes build, test, diagnostics, docs, and SwiftUI preview tools.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "xcode",
+    "xcode-mcp",
+    "swift",
+    "swiftui",
+    "swiftui-preview",
+    "mcp"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/igorkulman/pi-xcode-mcp.git"
+  },
+  "homepage": "https://github.com/igorkulman/pi-xcode-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/igorkulman/pi-xcode-mcp/issues"
+  },
+  "files": [
+    "extensions",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/xcode-mcp"
+    ]
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "prepack": "npm run typecheck"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@types/node": "^24.0.0",
+    "typebox": "*",
+    "typescript": "^5.9.3"
+  }
+}
