@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { readdir } from "node:fs/promises";
-import { basename, dirname } from "node:path";
+import { readFile, readdir } from "node:fs/promises";
+import { basename, dirname, extname, resolve } from "node:path";
 
 import {
   DEFAULT_MAX_BYTES,
@@ -45,6 +45,12 @@ type PiContent =
 type RegisteredToolInfo = {
   piToolName: string;
   mcpToolName: string;
+  inputSchema?: JsonObject;
+};
+
+type XcodeWindow = {
+  tabIdentifier: string;
+  workspacePath?: string;
 };
 
 type UiLike = {
@@ -65,6 +71,24 @@ const MAX_TEXT_RESULT_BYTES = DEFAULT_MAX_BYTES;
 const BaseMcpCallParams = Type.Object({
   name: Type.String({ description: "Xcode MCP tool name, e.g. RenderPreview, BuildProject, GetBuildLog, or the mirrored Pi tool name, e.g. xcode_render_preview." }),
   arguments: Type.Optional(Type.Record(Type.String(), Type.Any(), { description: "Arguments to pass to the MCP tool." })),
+});
+
+const BuildWithDiagnosticsParams = Type.Object({
+  arguments: Type.Optional(Type.Record(Type.String(), Type.Any(), { description: "Optional arguments forwarded to Xcode MCP BuildProject." })),
+  includeBuildLog: Type.Optional(Type.Union([
+    Type.Literal("onFailure"),
+    Type.Literal("always"),
+    Type.Literal("never"),
+  ], { description: "When to fetch Xcode MCP GetBuildLog after building. Defaults to onFailure." })),
+  includeNavigatorIssues: Type.Optional(Type.Boolean({ description: "Also fetch Xcode Issue Navigator diagnostics after a failed build when the tool is available. Defaults to true." })),
+});
+
+const RenderPreviewParams = Type.Object({
+  sourceFilePath: Type.String({ description: "Path to the SwiftUI source file within the Xcode project organization, e.g. ProjectName/Sources/MyView.swift." }),
+  previewDefinitionIndexInFile: Type.Optional(Type.Integer({ description: "Zero-based index of the #Preview macro or PreviewProvider in the source file. Defaults to 0." })),
+  previewVariantOverrides: Type.Optional(Type.Record(Type.String(), Type.Any(), { description: "Optional preview variant overrides returned by a previous render for the same scheme/destination." })),
+  timeout: Type.Optional(Type.Integer({ description: "Seconds to wait for preview rendering. Defaults to Xcode MCP's timeout." })),
+  tabIdentifier: Type.Optional(Type.String({ description: "Optional Xcode workspace tab identifier. Usually omitted because Pi resolves it automatically." })),
 });
 
 function isObject(value: unknown): value is JsonObject {
@@ -236,6 +260,7 @@ function getPromptGuidelines(mcpToolName: string, piToolName: string): string[] 
       return [
         `Use ${piToolName} when the user asks to inspect, verify, or iterate on a SwiftUI preview visually.`,
         `Use ${piToolName} after UI changes to capture the SwiftUI preview screenshot before judging visual correctness.`,
+        `${piToolName} auto-resolves the open Xcode tab and returns the rendered snapshot as an image when Xcode provides previewSnapshotPath.`,
       ];
     case "BuildProject":
       return [`Use ${piToolName} to build the active Xcode scheme when validating Swift or SwiftUI changes.`];
@@ -314,6 +339,280 @@ function mcpResultToPiContent(result: McpCallResult): PiContent[] {
   }
 
   return blocks;
+}
+
+function mcpResultText(result: McpCallResult): string {
+  const parts: string[] = [];
+
+  for (const item of result.content ?? []) {
+    if (item.type === "text" && typeof item.text === "string") {
+      parts.push(item.text);
+    } else if (item.type !== "image") {
+      parts.push(stringify(item));
+    }
+  }
+
+  if (result.structuredContent !== undefined) {
+    parts.push(stringify(result.structuredContent));
+  }
+
+  return parts.join("\n");
+}
+
+function structuredContentIndicatesFailure(value: unknown): boolean {
+  if (Array.isArray(value)) {
+    return value.some(structuredContentIndicatesFailure);
+  }
+
+  if (!isObject(value)) {
+    return false;
+  }
+
+  for (const [key, child] of Object.entries(value)) {
+    const normalizedKey = key.toLowerCase();
+
+    if (typeof child === "boolean" && child === false && ["success", "succeeded", "buildsucceeded", "passed"].includes(normalizedKey)) {
+      return true;
+    }
+
+    if (typeof child === "string" && /(status|state|result|outcome)/i.test(key) && /\b(failed|failure|error)\b/i.test(child)) {
+      return true;
+    }
+
+    if (structuredContentIndicatesFailure(child)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function resultIndicatesBuildFailure(result: McpCallResult): boolean {
+  if (result.isError) return true;
+  if (structuredContentIndicatesFailure(result.structuredContent)) return true;
+
+  return /\b(build failed|failed to build|compilation failed|compile failed|link failed|fatal error:)\b|\berror:/i.test(mcpResultText(result));
+}
+
+function sectionedContent(title: string, result: McpCallResult): PiContent[] {
+  const blocks = mcpResultToPiContent(result);
+  const firstText = blocks.find((block): block is { type: "text"; text: string } => block.type === "text");
+
+  if (firstText) {
+    firstText.text = `## ${title}\n\n${firstText.text}`;
+  } else {
+    blocks.unshift({ type: "text", text: `## ${title}` });
+  }
+
+  return blocks;
+}
+
+function mcpToolErrorResult(toolName: string, error: unknown): McpCallResult {
+  const message = error instanceof Error ? error.message : String(error);
+  return {
+    isError: true,
+    content: [{ type: "text", text: `${toolName} failed: ${message}` }],
+  };
+}
+
+function schemaRequiresArgument(schema: unknown, argumentName: string): boolean {
+  if (!isObject(schema)) return false;
+  return Array.isArray(schema.required) && schema.required.includes(argumentName);
+}
+
+function piInputSchemaWithAutoResolvedTabIdentifier(schema: unknown): unknown {
+  if (!schemaRequiresArgument(schema, "tabIdentifier") || !isObject(schema)) return schema;
+
+  const required = Array.isArray(schema.required) ? schema.required.filter((item) => item !== "tabIdentifier") : [];
+  return {
+    ...schema,
+    required,
+  };
+}
+
+function collectStringsFromMcpResult(result: McpCallResult): string[] {
+  const strings: string[] = [];
+
+  const visit = (value: unknown): void => {
+    if (typeof value === "string") {
+      strings.push(value);
+      try {
+        visit(JSON.parse(value));
+      } catch {
+        // Not JSON; keep the original string only.
+      }
+      return;
+    }
+
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item);
+      return;
+    }
+
+    if (isObject(value)) {
+      for (const child of Object.values(value)) visit(child);
+    }
+  };
+
+  visit(result.content ?? []);
+  visit(result.structuredContent);
+  return strings;
+}
+
+function extractWindowsFromValue(value: unknown, windows: XcodeWindow[]): void {
+  if (Array.isArray(value)) {
+    for (const item of value) extractWindowsFromValue(item, windows);
+    return;
+  }
+
+  if (!isObject(value)) return;
+
+  if (typeof value.tabIdentifier === "string") {
+    windows.push({
+      tabIdentifier: value.tabIdentifier,
+      workspacePath: typeof value.workspacePath === "string" ? value.workspacePath : undefined,
+    });
+  }
+
+  for (const child of Object.values(value)) {
+    extractWindowsFromValue(child, windows);
+  }
+}
+
+function parseXcodeWindows(result: McpCallResult): XcodeWindow[] {
+  const windows: XcodeWindow[] = [];
+  extractWindowsFromValue(result.structuredContent, windows);
+
+  for (const text of collectStringsFromMcpResult(result)) {
+    for (const line of text.split(/\r?\n/)) {
+      const match = line.match(/tabIdentifier:\s*([^,\s]+)(?:,\s*workspacePath:\s*(.+))?/);
+      if (match) {
+        windows.push({ tabIdentifier: match[1], workspacePath: match[2]?.trim() });
+      }
+    }
+  }
+
+  const byIdentifier = new Map<string, XcodeWindow>();
+  for (const window of windows) {
+    const existing = byIdentifier.get(window.tabIdentifier);
+    byIdentifier.set(window.tabIdentifier, {
+      tabIdentifier: window.tabIdentifier,
+      workspacePath: existing?.workspacePath ?? window.workspacePath,
+    });
+  }
+
+  return Array.from(byIdentifier.values());
+}
+
+function xcodeWorkspaceRoot(workspacePath: string): string {
+  const absolute = resolve(workspacePath);
+  return absolute.endsWith(".xcodeproj") || absolute.endsWith(".xcworkspace") ? dirname(absolute) : absolute;
+}
+
+function pathContains(parent: string, child: string): boolean {
+  return child === parent || child.startsWith(`${parent}/`);
+}
+
+function scoreWindowForCwd(window: XcodeWindow, cwd: string): number {
+  if (!window.workspacePath) return 0;
+
+  const absoluteCwd = resolve(cwd);
+  const absoluteWorkspacePath = resolve(window.workspacePath);
+  const workspaceRoot = xcodeWorkspaceRoot(window.workspacePath);
+
+  if (absoluteWorkspacePath === absoluteCwd) return 5;
+  if (workspaceRoot === absoluteCwd) return 4;
+  if (pathContains(workspaceRoot, absoluteCwd)) return 3;
+  if (pathContains(absoluteCwd, workspaceRoot)) return 2;
+
+  return 0;
+}
+
+function formatXcodeWindows(windows: XcodeWindow[]): string {
+  return windows
+    .map((window) => `- ${window.tabIdentifier}${window.workspacePath ? ` — ${window.workspacePath}` : ""}`)
+    .join("\n");
+}
+
+function collectPreviewSnapshotPaths(value: unknown, paths: string[]): void {
+  if (Array.isArray(value)) {
+    for (const item of value) collectPreviewSnapshotPaths(item, paths);
+    return;
+  }
+
+  if (!isObject(value)) return;
+
+  if (typeof value.previewSnapshotPath === "string" && value.previewSnapshotPath.trim()) {
+    paths.push(value.previewSnapshotPath);
+  }
+
+  for (const child of Object.values(value)) {
+    collectPreviewSnapshotPaths(child, paths);
+  }
+}
+
+function previewSnapshotPaths(result: McpCallResult): string[] {
+  const paths: string[] = [];
+  collectPreviewSnapshotPaths(result.structuredContent, paths);
+
+  for (const text of collectStringsFromMcpResult(result)) {
+    try {
+      collectPreviewSnapshotPaths(JSON.parse(text), paths);
+    } catch {
+      const match = text.match(/"previewSnapshotPath"\s*:\s*"([^"]+)"/);
+      if (match) paths.push(match[1].replace(/\\\//g, "/"));
+    }
+  }
+
+  return Array.from(new Set(paths));
+}
+
+function imageMimeType(path: string): string {
+  switch (extname(path).toLowerCase()) {
+    case ".jpg":
+    case ".jpeg":
+      return "image/jpeg";
+    case ".gif":
+      return "image/gif";
+    case ".webp":
+      return "image/webp";
+    default:
+      return "image/png";
+  }
+}
+
+async function appendPreviewSnapshotImages(content: PiContent[], result: McpCallResult): Promise<void> {
+  const paths = previewSnapshotPaths(result);
+  if (paths.length === 0) return;
+
+  for (const path of paths) {
+    try {
+      const image = await readFile(path);
+      content.push({ type: "text", text: `SwiftUI preview snapshot: ${path}` });
+      content.push({ type: "image", data: image.toString("base64"), mimeType: imageMimeType(path) });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      content.push({ type: "text", text: `SwiftUI preview snapshot was rendered at ${path}, but Pi could not read it: ${message}` });
+    }
+  }
+}
+
+function previewResultIndicatesFailure(result: McpCallResult): boolean {
+  if (result.isError) return true;
+
+  const hasErrorsField = (value: unknown): boolean => {
+    if (Array.isArray(value)) return value.some(hasErrorsField);
+    if (!isObject(value)) return false;
+
+    for (const [key, child] of Object.entries(value)) {
+      if (key === "errors" && Array.isArray(child) && child.length > 0) return true;
+      if (hasErrorsField(child)) return true;
+    }
+
+    return false;
+  };
+
+  return hasErrorsField(result.structuredContent);
 }
 
 class StdioMcpClient {
@@ -598,6 +897,69 @@ export default function xcodeMcpExtension(pi: ExtensionAPI) {
     return toolInfoByPiName.get(name)?.mcpToolName ?? name;
   }
 
+  function findMcpToolName(...candidates: string[]): string | undefined {
+    for (const candidate of candidates) {
+      if (toolInfoByMcpName.has(candidate)) return candidate;
+      const byPiName = toolInfoByPiName.get(candidate) ?? toolInfoByPiName.get(toPiToolName(candidate));
+      if (byPiName) return byPiName.mcpToolName;
+    }
+
+    return undefined;
+  }
+
+  function mcpToolRequiresArgument(mcpToolName: string, argumentName: string): boolean {
+    return schemaRequiresArgument(toolInfoByMcpName.get(mcpToolName)?.inputSchema, argumentName);
+  }
+
+  async function listXcodeWindows(activeClient: StdioMcpClient, signal?: AbortSignal): Promise<XcodeWindow[]> {
+    const listWindowsToolName = findMcpToolName("XcodeListWindows", "ListWindows");
+    if (!listWindowsToolName) return [];
+
+    const result = await activeClient.callTool(listWindowsToolName, {}, signal);
+    return parseXcodeWindows(result);
+  }
+
+  async function resolveTabIdentifier(activeClient: StdioMcpClient, args: JsonObject, ctx: { cwd: string; signal?: AbortSignal }): Promise<string> {
+    if (typeof args.tabIdentifier === "string" && args.tabIdentifier.trim()) {
+      return args.tabIdentifier;
+    }
+
+    const windows = await listXcodeWindows(activeClient, ctx.signal);
+    if (windows.length === 0) {
+      throw new Error("Xcode MCP requires tabIdentifier, but no Xcode windows were returned by XcodeListWindows.");
+    }
+
+    const scored = windows.map((window) => ({ window, score: scoreWindowForCwd(window, ctx.cwd) }));
+    const bestScore = Math.max(...scored.map((item) => item.score));
+    const candidates = bestScore > 0
+      ? scored.filter((item) => item.score === bestScore).map((item) => item.window)
+      : windows.length === 1
+        ? windows
+        : [];
+
+    if (candidates.length === 1) return candidates[0].tabIdentifier;
+
+    throw new Error(
+      `Xcode MCP requires tabIdentifier, but Pi could not choose a unique Xcode workspace tab for ${ctx.cwd}. ` +
+      `Pass { "tabIdentifier": "..." } in tool arguments. Open windows:\n${formatXcodeWindows(windows)}`,
+    );
+  }
+
+  async function argumentsWithResolvedTabIdentifier(
+    activeClient: StdioMcpClient,
+    mcpToolName: string,
+    args: JsonObject,
+    ctx: { cwd: string; signal?: AbortSignal },
+  ): Promise<JsonObject> {
+    if (!mcpToolRequiresArgument(mcpToolName, "tabIdentifier")) return args;
+    if (typeof args.tabIdentifier === "string" && args.tabIdentifier.trim()) return args;
+
+    return {
+      ...args,
+      tabIdentifier: await resolveTabIdentifier(activeClient, args, ctx),
+    };
+  }
+
   async function disconnect(): Promise<void> {
     const active = client;
     client = undefined;
@@ -647,22 +1009,162 @@ export default function xcodeMcpExtension(pi: ExtensionAPI) {
   async function callXcodeTool(name: string, args: JsonObject, ctx: { ui: UiLike; cwd: string; signal?: AbortSignal }, onUpdate?: (partial: { content: PiContent[]; details: JsonObject }) => void) {
     const activeClient = await ensureConnected(ctx);
     const mcpToolName = resolveMcpToolName(name);
+    const resolvedArgs = await argumentsWithResolvedTabIdentifier(activeClient, mcpToolName, args, ctx);
 
     onUpdate?.({
       content: [{ type: "text", text: `Calling Xcode MCP tool: ${mcpToolName}...` }],
-      details: { mcpTool: mcpToolName },
+      details: { mcpTool: mcpToolName, arguments: resolvedArgs },
     });
 
-    const result = await activeClient.callTool(mcpToolName, args, ctx.signal);
+    const result = await activeClient.callTool(mcpToolName, resolvedArgs, ctx.signal);
+    const content = mcpResultToPiContent(result);
+    const isPreviewTool = mcpToolName === "RenderPreview";
+    if (isPreviewTool) {
+      await appendPreviewSnapshotImages(content, result);
+    }
+
     return {
-      content: mcpResultToPiContent(result),
-      details: { mcpTool: mcpToolName, raw: result },
-      isError: Boolean(result.isError),
+      content,
+      details: { mcpTool: mcpToolName, arguments: resolvedArgs, raw: result },
+      isError: isPreviewTool ? previewResultIndicatesFailure(result) : Boolean(result.isError),
+    };
+  }
+
+  async function renderPreview(
+    params: JsonObject,
+    ctx: { ui: UiLike; cwd: string; signal?: AbortSignal },
+    onUpdate?: (partial: { content: PiContent[]; details: JsonObject }) => void,
+  ) {
+    const activeClient = await ensureConnected(ctx);
+    const renderPreviewToolName = findMcpToolName("RenderPreview", "XcodeRenderPreview");
+
+    if (!renderPreviewToolName) {
+      throw new Error(`Xcode MCP did not advertise a SwiftUI preview render tool. Discovered tools:\n${toolLines().join("\n")}`);
+    }
+
+    const renderArgs = await argumentsWithResolvedTabIdentifier(activeClient, renderPreviewToolName, params, ctx);
+
+    onUpdate?.({
+      content: [{ type: "text", text: `Rendering SwiftUI preview through Xcode MCP (${renderPreviewToolName})...` }],
+      details: { renderPreviewTool: renderPreviewToolName, arguments: renderArgs },
+    });
+
+    const result = await activeClient.callTool(renderPreviewToolName, renderArgs, ctx.signal);
+    const content = mcpResultToPiContent(result);
+    await appendPreviewSnapshotImages(content, result);
+
+    return {
+      content,
+      details: { renderPreviewTool: renderPreviewToolName, arguments: renderArgs, raw: result },
+      isError: previewResultIndicatesFailure(result),
+    };
+  }
+
+  async function buildWithDiagnostics(
+    params: { arguments?: JsonObject; includeBuildLog?: "onFailure" | "always" | "never"; includeNavigatorIssues?: boolean },
+    ctx: { ui: UiLike; cwd: string; signal?: AbortSignal },
+    onUpdate?: (partial: { content: PiContent[]; details: JsonObject }) => void,
+  ) {
+    const activeClient = await ensureConnected(ctx);
+    const buildToolName = findMcpToolName("BuildProject", "XcodeBuildProject");
+
+    if (!buildToolName) {
+      throw new Error(`Xcode MCP did not advertise a build tool. Discovered tools:\n${toolLines().join("\n")}`);
+    }
+
+    const buildArgs = await argumentsWithResolvedTabIdentifier(activeClient, buildToolName, params.arguments ?? {}, ctx);
+
+    onUpdate?.({
+      content: [{ type: "text", text: `Building active Xcode scheme through Xcode MCP (${buildToolName})...` }],
+      details: { buildTool: buildToolName, arguments: buildArgs },
+    });
+
+    let buildResult: McpCallResult;
+    try {
+      buildResult = await activeClient.callTool(buildToolName, buildArgs, ctx.signal);
+    } catch (error) {
+      buildResult = mcpToolErrorResult(buildToolName, error);
+    }
+
+    const buildFailed = resultIndicatesBuildFailure(buildResult);
+    const includeBuildLog = params.includeBuildLog ?? "onFailure";
+    const includeNavigatorIssues = params.includeNavigatorIssues ?? true;
+    const shouldFetchBuildLog = includeBuildLog === "always" || (includeBuildLog === "onFailure" && buildFailed);
+    const content: PiContent[] = [
+      {
+        type: "text",
+        text: buildFailed
+          ? "Xcode MCP build reported a failure. I fetched available Xcode diagnostics below."
+          : "Xcode MCP build completed without detected build errors.",
+      },
+      ...sectionedContent("BuildProject", buildResult),
+    ];
+    const details: JsonObject = {
+      buildTool: buildToolName,
+      buildArguments: buildArgs,
+      buildFailed,
+      buildResult,
+    };
+    const diagnosticBaseArgs: JsonObject = typeof buildArgs.tabIdentifier === "string" ? { tabIdentifier: buildArgs.tabIdentifier } : {};
+
+    if (shouldFetchBuildLog) {
+      const buildLogToolName = findMcpToolName("GetBuildLog", "XcodeGetBuildLog");
+      if (buildLogToolName) {
+        const buildLogArgs = await argumentsWithResolvedTabIdentifier(activeClient, buildLogToolName, diagnosticBaseArgs, ctx);
+
+        onUpdate?.({
+          content: [{ type: "text", text: `Fetching Xcode build log through MCP (${buildLogToolName})...` }],
+          details: { buildTool: buildToolName, buildLogTool: buildLogToolName, buildFailed, arguments: buildLogArgs },
+        });
+
+        let buildLogResult: McpCallResult;
+        try {
+          buildLogResult = await activeClient.callTool(buildLogToolName, buildLogArgs, ctx.signal);
+        } catch (error) {
+          buildLogResult = mcpToolErrorResult(buildLogToolName, error);
+        }
+        content.push(...sectionedContent("GetBuildLog", buildLogResult));
+        details.buildLogTool = buildLogToolName;
+        details.buildLogArguments = buildLogArgs;
+        details.buildLogResult = buildLogResult;
+      } else {
+        content.push({ type: "text", text: "## GetBuildLog\n\nXcode MCP did not advertise a GetBuildLog tool." });
+      }
+    }
+
+    if (buildFailed && includeNavigatorIssues) {
+      const navigatorIssuesToolName = findMcpToolName("XcodeListNavigatorIssues", "ListNavigatorIssues");
+      if (navigatorIssuesToolName) {
+        const navigatorIssuesArgs = await argumentsWithResolvedTabIdentifier(activeClient, navigatorIssuesToolName, diagnosticBaseArgs, ctx);
+
+        onUpdate?.({
+          content: [{ type: "text", text: `Fetching Xcode Issue Navigator diagnostics through MCP (${navigatorIssuesToolName})...` }],
+          details: { buildTool: buildToolName, navigatorIssuesTool: navigatorIssuesToolName, buildFailed, arguments: navigatorIssuesArgs },
+        });
+
+        let navigatorIssuesResult: McpCallResult;
+        try {
+          navigatorIssuesResult = await activeClient.callTool(navigatorIssuesToolName, navigatorIssuesArgs, ctx.signal);
+        } catch (error) {
+          navigatorIssuesResult = mcpToolErrorResult(navigatorIssuesToolName, error);
+        }
+        content.push(...sectionedContent("Issue Navigator", navigatorIssuesResult));
+        details.navigatorIssuesTool = navigatorIssuesToolName;
+        details.navigatorIssuesArguments = navigatorIssuesArgs;
+        details.navigatorIssuesResult = navigatorIssuesResult;
+      }
+    }
+
+    return {
+      content,
+      details,
+      isError: buildFailed,
     };
   }
 
   function registerMcpTool(tool: McpTool): void {
-    const info = { piToolName: toPiToolName(tool.name), mcpToolName: tool.name };
+    const info = { piToolName: toPiToolName(tool.name), mcpToolName: tool.name, inputSchema: tool.inputSchema };
+    const piInputSchema = piInputSchemaWithAutoResolvedTabIdentifier(tool.inputSchema);
     toolInfoByPiName.set(info.piToolName, info);
     toolInfoByMcpName.set(info.mcpToolName, info);
 
@@ -672,10 +1174,10 @@ export default function xcodeMcpExtension(pi: ExtensionAPI) {
     pi.registerTool({
       name: info.piToolName,
       label: toLabel(tool),
-      description: buildToolDescription(tool),
+      description: buildToolDescription({ ...tool, inputSchema: isObject(piInputSchema) ? piInputSchema : tool.inputSchema }),
       promptSnippet: `Call Xcode MCP tool ${tool.name}`,
       promptGuidelines: getPromptGuidelines(tool.name, info.piToolName),
-      parameters: schemaToTypeBox(tool.inputSchema),
+      parameters: schemaToTypeBox(piInputSchema),
       async execute(_toolCallId, params, signal, onUpdate, ctx) {
         return callXcodeTool(tool.name, (params ?? {}) as JsonObject, { ui: ctx.ui, cwd: ctx.cwd, signal }, onUpdate);
       },
@@ -698,6 +1200,39 @@ export default function xcodeMcpExtension(pi: ExtensionAPI) {
         content: [{ type: "text", text: `Connected to Xcode MCP. Discovered tools:\n${toolLines().join("\n")}` }],
         details: { tools: Array.from(toolInfoByPiName.values()) },
       };
+    },
+  });
+
+  registeredPiToolNames.add("xcode_render_preview");
+  pi.registerTool({
+    name: "xcode_render_preview",
+    label: "Render SwiftUI Preview",
+    description: "Render a SwiftUI preview through Xcode MCP, auto-resolve the open Xcode tab, and attach Xcode's rendered preview snapshot image to the tool result.",
+    promptSnippet: "Render a SwiftUI preview screenshot through Xcode MCP",
+    promptGuidelines: [
+      "Use xcode_render_preview when the user asks to inspect, verify, or iterate on a SwiftUI preview visually.",
+      "Use xcode_render_preview after SwiftUI UI changes to capture the rendered preview screenshot before judging visual correctness.",
+      "xcode_render_preview auto-resolves the open Xcode tab and returns the rendered snapshot as an image when Xcode provides previewSnapshotPath.",
+    ],
+    parameters: RenderPreviewParams,
+    async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      return renderPreview(params, { ui: ctx.ui, cwd: ctx.cwd, signal }, onUpdate);
+    },
+  });
+
+  pi.registerTool({
+    name: "xcode_build",
+    label: "Xcode Build",
+    description: "Build the active Xcode scheme through Xcode MCP, then automatically fetch Xcode build errors and diagnostics when the build fails. This is usually faster and more project-aware than shelling out to xcodebuild because it uses the running Xcode instance.",
+    promptSnippet: "Build the active Xcode scheme through Xcode MCP and fetch errors on failure",
+    promptGuidelines: [
+      "Prefer xcode_build over shell xcodebuild when validating Swift, SwiftUI, or Xcode project changes and Xcode MCP is available.",
+      "Use xcode_build to build through the running Xcode instance and automatically retrieve GetBuildLog/Issue Navigator diagnostics on failure.",
+      "Only fall back to shell xcodebuild when Xcode MCP is unavailable or the user explicitly asks for command-line xcodebuild.",
+    ],
+    parameters: BuildWithDiagnosticsParams,
+    async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      return buildWithDiagnostics(params, { ui: ctx.ui, cwd: ctx.cwd, signal }, onUpdate);
     },
   });
 
