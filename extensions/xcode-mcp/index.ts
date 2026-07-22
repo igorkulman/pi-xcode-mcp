@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { readFile, readdir } from "node:fs/promises";
-import { basename, dirname, extname, resolve } from "node:path";
+import { basename, dirname, extname } from "node:path";
 
 import {
   DEFAULT_MAX_BYTES,
@@ -12,17 +12,27 @@ import {
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type, type TSchema } from "typebox";
 
-type JsonObject = Record<string, unknown>;
-type JsonRpcId = number | string;
+import {
+  DEFAULT_TOOL_TIMEOUT_MS,
+  McpConnectionGate,
+  McpToolCatalog,
+  SerialAsyncQueue,
+  TOOL_TIMEOUT_ENV_NAME,
+  dispatchMcpServerNotification,
+  parseToolTimeoutMs,
+  reconcileActiveToolNames,
+  schemaRequiresArgument,
+  selectMatchingXcodeWindow,
+  stripLeadingXcode,
+  terminateChildProcess,
+  toolTimeoutMsForCall,
+  type JsonObject,
+  type McpTool,
+  type McpToolCatalogEntry,
+  type XcodeWindow,
+} from "./mcp-session.js";
 
-type McpTool = {
-  name: string;
-  title?: string;
-  description?: string;
-  inputSchema?: JsonObject;
-  outputSchema?: JsonObject;
-  annotations?: JsonObject;
-};
+type JsonRpcId = number | string;
 
 type McpContent =
   | { type: "text"; text?: unknown; [key: string]: unknown }
@@ -42,17 +52,6 @@ type PiContent =
   | { type: "text"; text: string }
   | { type: "image"; data: string; mimeType: string };
 
-type RegisteredToolInfo = {
-  piToolName: string;
-  mcpToolName: string;
-  inputSchema?: JsonObject;
-};
-
-type XcodeWindow = {
-  tabIdentifier: string;
-  workspacePath?: string;
-};
-
 type UiLike = {
   notify(message: string, level?: "info" | "warning" | "error"): void;
   setStatus(key: string, value: string | undefined): void;
@@ -64,7 +63,6 @@ const CLIENT_NAME = "pi-xcode-mcp";
 const CLIENT_VERSION = "0.1.0";
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 const DEFAULT_CONNECT_TIMEOUT_MS = 30_000;
-const DEFAULT_TOOL_TIMEOUT_MS = 120_000;
 const MAX_STORED_STDERR_LINES = 40;
 const MAX_TEXT_RESULT_BYTES = DEFAULT_MAX_BYTES;
 
@@ -143,24 +141,6 @@ async function looksLikeXcodeWorkspace(cwd: string): Promise<boolean> {
   }
 
   return false;
-}
-
-function stripLeadingXcode(name: string): string {
-  return name.replace(/^Xcode(?=[A-Z_\-]|$)/, "");
-}
-
-function toSnakeCase(name: string): string {
-  return name
-    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
-    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1_$2")
-    .replace(/[^a-zA-Z0-9]+/g, "_")
-    .replace(/^_+|_+$/g, "")
-    .toLowerCase();
-}
-
-function toPiToolName(mcpToolName: string): string {
-  const normalized = toSnakeCase(stripLeadingXcode(mcpToolName));
-  return normalized.startsWith("xcode_") ? normalized : `xcode_${normalized}`;
 }
 
 function toLabel(tool: McpTool): string {
@@ -415,11 +395,6 @@ function mcpToolErrorResult(toolName: string, error: unknown): McpCallResult {
   };
 }
 
-function schemaRequiresArgument(schema: unknown, argumentName: string): boolean {
-  if (!isObject(schema)) return false;
-  return Array.isArray(schema.required) && schema.required.includes(argumentName);
-}
-
 function piInputSchemaWithAutoResolvedTabIdentifier(schema: unknown): unknown {
   if (!schemaRequiresArgument(schema, "tabIdentifier") || !isObject(schema)) return schema;
 
@@ -502,30 +477,6 @@ function parseXcodeWindows(result: McpCallResult): XcodeWindow[] {
   }
 
   return Array.from(byIdentifier.values());
-}
-
-function xcodeWorkspaceRoot(workspacePath: string): string {
-  const absolute = resolve(workspacePath);
-  return absolute.endsWith(".xcodeproj") || absolute.endsWith(".xcworkspace") ? dirname(absolute) : absolute;
-}
-
-function pathContains(parent: string, child: string): boolean {
-  return child === parent || child.startsWith(`${parent}/`);
-}
-
-function scoreWindowForCwd(window: XcodeWindow, cwd: string): number {
-  if (!window.workspacePath) return 0;
-
-  const absoluteCwd = resolve(cwd);
-  const absoluteWorkspacePath = resolve(window.workspacePath);
-  const workspaceRoot = xcodeWorkspaceRoot(window.workspacePath);
-
-  if (absoluteWorkspacePath === absoluteCwd) return 5;
-  if (workspaceRoot === absoluteCwd) return 4;
-  if (pathContains(workspaceRoot, absoluteCwd)) return 3;
-  if (pathContains(absoluteCwd, workspaceRoot)) return 2;
-
-  return 0;
 }
 
 function formatXcodeWindows(windows: XcodeWindow[]): string {
@@ -621,8 +572,12 @@ class StdioMcpClient {
   private nextId = 1;
   private pending = new Map<JsonRpcId, { resolve: (value: unknown) => void; reject: (error: Error) => void; timeout: NodeJS.Timeout }>();
   private stderrLines: string[] = [];
+  private toolsChangedHandler: (() => void) | undefined;
 
-  constructor(private readonly cwd: string) {}
+  constructor(
+    private readonly cwd: string,
+    private readonly defaultToolTimeoutMs = DEFAULT_TOOL_TIMEOUT_MS,
+  ) {}
 
   get lastStderr(): string {
     return this.stderrLines.join("\n");
@@ -630,6 +585,10 @@ class StdioMcpClient {
 
   get connected(): boolean {
     return Boolean(this.child && !this.child.killed);
+  }
+
+  setToolsChangedHandler(handler: (() => void) | undefined): void {
+    this.toolsChangedHandler = handler;
   }
 
   async connect(signal?: AbortSignal): Promise<void> {
@@ -687,24 +646,7 @@ class StdioMcpClient {
     this.rejectAll(new Error("Xcode MCP connection closed."));
 
     if (!active) return;
-
-    active.stdin.end();
-
-    await new Promise<void>((resolve) => {
-      const done = () => resolve();
-      const termTimer = setTimeout(() => {
-        if (!active.killed) active.kill("SIGTERM");
-      }, 750);
-      const killTimer = setTimeout(() => {
-        if (!active.killed) active.kill("SIGKILL");
-      }, 2_000);
-
-      active.once("exit", () => {
-        clearTimeout(termTimer);
-        clearTimeout(killTimer);
-        done();
-      });
-    });
+    await terminateChildProcess(active);
   }
 
   async listTools(signal?: AbortSignal): Promise<McpTool[]> {
@@ -722,8 +664,13 @@ class StdioMcpClient {
     return tools;
   }
 
-  async callTool(name: string, args: JsonObject, signal?: AbortSignal): Promise<McpCallResult> {
-    const result = await this.request("tools/call", { name, arguments: args }, DEFAULT_TOOL_TIMEOUT_MS, signal);
+  async callTool(
+    name: string,
+    args: JsonObject,
+    signal?: AbortSignal,
+    timeoutMs = this.defaultToolTimeoutMs,
+  ): Promise<McpCallResult> {
+    const result = await this.request("tools/call", { name, arguments: args }, timeoutMs, signal);
     return isObject(result) ? result as McpCallResult : { content: [{ type: "text", text: stringify(result) }] };
   }
 
@@ -830,6 +777,10 @@ class StdioMcpClient {
       return;
     }
 
+    if (dispatchMcpServerNotification(message, { toolsListChanged: this.toolsChangedHandler })) {
+      return;
+    }
+
     if (typeof message.method === "string" && message.id !== undefined) {
       this.handleServerRequest(message.id as JsonRpcId, message.method, message.params);
     }
@@ -873,46 +824,21 @@ class StdioMcpClient {
 }
 
 export default function xcodeMcpExtension(pi: ExtensionAPI) {
+  const defaultToolTimeoutMs = parseToolTimeoutMs(process.env[TOOL_TIMEOUT_ENV_NAME]);
   let client: StdioMcpClient | undefined;
-  let connectPromise: Promise<void> | undefined;
+  let latestConnectPromise: Promise<void> | undefined;
 
-  const registeredPiToolNames = new Set<string>();
-  const toolInfoByPiName = new Map<string, RegisteredToolInfo>();
-  const toolInfoByMcpName = new Map<string, RegisteredToolInfo>();
+  const connectionGate = new McpConnectionGate();
+  const connectionQueue = new SerialAsyncQueue();
+  const toolCatalog = new McpToolCatalog(["xcode_build", "xcode_render_preview"]);
+  const toolRefreshQueue = new SerialAsyncQueue();
 
   function setStatus(ctx: { ui: UiLike } | undefined, value: string | undefined): void {
     ctx?.ui.setStatus(STATUS_KEY, value);
   }
 
-  function toolLines(): string[] {
-    if (toolInfoByPiName.size === 0) return ["No Xcode MCP tools discovered yet."];
-
-    return Array.from(toolInfoByPiName.values())
-      .sort((a, b) => a.piToolName.localeCompare(b.piToolName))
-      .map((tool) => `${tool.piToolName} → ${tool.mcpToolName}`);
-  }
-
-  function resolveMcpToolName(name: string): string {
-    if (toolInfoByMcpName.has(name)) return name;
-    return toolInfoByPiName.get(name)?.mcpToolName ?? name;
-  }
-
-  function findMcpToolName(...candidates: string[]): string | undefined {
-    for (const candidate of candidates) {
-      if (toolInfoByMcpName.has(candidate)) return candidate;
-      const byPiName = toolInfoByPiName.get(candidate) ?? toolInfoByPiName.get(toPiToolName(candidate));
-      if (byPiName) return byPiName.mcpToolName;
-    }
-
-    return undefined;
-  }
-
-  function mcpToolRequiresArgument(mcpToolName: string, argumentName: string): boolean {
-    return schemaRequiresArgument(toolInfoByMcpName.get(mcpToolName)?.inputSchema, argumentName);
-  }
-
   async function listXcodeWindows(activeClient: StdioMcpClient, signal?: AbortSignal): Promise<XcodeWindow[]> {
-    const listWindowsToolName = findMcpToolName("XcodeListWindows", "ListWindows");
+    const listWindowsToolName = toolCatalog.findMcpToolName("XcodeListWindows", "ListWindows");
     if (!listWindowsToolName) return [];
 
     const result = await activeClient.callTool(listWindowsToolName, {}, signal);
@@ -929,19 +855,12 @@ export default function xcodeMcpExtension(pi: ExtensionAPI) {
       throw new Error("Xcode MCP requires tabIdentifier, but no Xcode windows were returned by XcodeListWindows.");
     }
 
-    const scored = windows.map((window) => ({ window, score: scoreWindowForCwd(window, ctx.cwd) }));
-    const bestScore = Math.max(...scored.map((item) => item.score));
-    const candidates = bestScore > 0
-      ? scored.filter((item) => item.score === bestScore).map((item) => item.window)
-      : windows.length === 1
-        ? windows
-        : [];
-
-    if (candidates.length === 1) return candidates[0].tabIdentifier;
+    const selectedWindow = selectMatchingXcodeWindow(windows, ctx.cwd);
+    if (selectedWindow) return selectedWindow.tabIdentifier;
 
     throw new Error(
-      `Xcode MCP requires tabIdentifier, but Pi could not choose a unique Xcode workspace tab for ${ctx.cwd}. ` +
-      `Pass { "tabIdentifier": "..." } in tool arguments. Open windows:\n${formatXcodeWindows(windows)}`,
+      `Xcode MCP requires tabIdentifier, but no unique Xcode workspace tab matches ${ctx.cwd}. ` +
+      `Open this worktree in Xcode or pass { "tabIdentifier": "..." } explicitly. Open windows:\n${formatXcodeWindows(windows)}`,
     );
   }
 
@@ -951,7 +870,7 @@ export default function xcodeMcpExtension(pi: ExtensionAPI) {
     args: JsonObject,
     ctx: { cwd: string; signal?: AbortSignal },
   ): Promise<JsonObject> {
-    if (!mcpToolRequiresArgument(mcpToolName, "tabIdentifier")) return args;
+    if (!toolCatalog.requiresArgument(mcpToolName, "tabIdentifier")) return args;
     if (typeof args.tabIdentifier === "string" && args.tabIdentifier.trim()) return args;
 
     return {
@@ -960,55 +879,138 @@ export default function xcodeMcpExtension(pi: ExtensionAPI) {
     };
   }
 
-  async function disconnect(): Promise<void> {
-    const active = client;
-    client = undefined;
-    if (active) await active.close();
+  async function closeClient(targetClient: StdioMcpClient): Promise<void> {
+    targetClient.setToolsChangedHandler(undefined);
+    if (client === targetClient) client = undefined;
+    await targetClient.close();
   }
 
-  async function discoverTools(ctx?: { ui: UiLike; cwd: string; signal?: AbortSignal }): Promise<number> {
-    if (!client) throw new Error("Xcode MCP client is not connected.");
+  async function closeCurrentClient(): Promise<void> {
+    const activeClient = client;
+    if (activeClient) await closeClient(activeClient);
+  }
 
-    const tools = await client.listTools(ctx?.signal);
-    for (const tool of tools) {
-      registerMcpTool(tool);
+  async function disconnect(): Promise<void> {
+    connectionGate.cancelPending();
+    await closeCurrentClient();
+  }
+
+  async function discoverTools(
+    ctx: { ui: UiLike; cwd: string; signal?: AbortSignal } | undefined,
+    activeClient: StdioMcpClient,
+    shouldApply: () => boolean,
+  ): Promise<number | undefined> {
+    const tools = await activeClient.listTools(ctx?.signal);
+    if (!shouldApply()) return undefined;
+
+    const change = toolCatalog.replace(tools);
+    for (const entry of change.registrations) {
+      registerMcpTool(entry);
+    }
+
+    if (change.addedPiToolNames.length > 0 || change.removedPiToolNames.length > 0) {
+      pi.setActiveTools(reconcileActiveToolNames(pi.getActiveTools(), change));
     }
 
     setStatus(ctx, `xcode mcp: ${tools.length} tools`);
     return tools.length;
   }
 
-  async function connect(ctx?: { ui: UiLike; cwd: string; signal?: AbortSignal }): Promise<void> {
-    await disconnect();
+  function refreshToolCatalog(
+    sourceClient: StdioMcpClient,
+    ctx?: { ui: UiLike; cwd: string; signal?: AbortSignal },
+    connectionGeneration?: number,
+  ): Promise<number | undefined> {
+    const shouldApply = () => (
+      client === sourceClient
+      && sourceClient.connected
+      && (connectionGeneration === undefined || connectionGate.isCurrent(connectionGeneration))
+    );
+
+    return toolRefreshQueue.enqueue(async () => {
+      if (!shouldApply()) return undefined;
+      return discoverTools(ctx, sourceClient, shouldApply);
+    });
+  }
+
+  function queueToolCatalogRefresh(sourceClient: StdioMcpClient): void {
+    void refreshToolCatalog(sourceClient).catch((error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`[pi-xcode-mcp] Failed to refresh Xcode MCP tools: ${message}`);
+    });
+  }
+
+  async function performConnect(
+    connectionGeneration: number,
+    ctx?: { ui: UiLike; cwd: string; signal?: AbortSignal },
+  ): Promise<void> {
+    connectionGate.assertCurrent(connectionGeneration);
+    await closeCurrentClient();
+    connectionGate.assertCurrent(connectionGeneration);
 
     setStatus(ctx, "xcode mcp: connecting...");
-    const nextClient = new StdioMcpClient(ctx?.cwd ?? process.cwd());
-    await nextClient.connect(ctx?.signal);
+    const nextClient = new StdioMcpClient(ctx?.cwd ?? process.cwd(), defaultToolTimeoutMs);
     client = nextClient;
 
-    const count = await discoverTools(ctx);
-    setStatus(ctx, `xcode mcp: ${count} tools`);
-    ctx?.ui.notify(`Connected to Xcode MCP (${count} tools).`, "info");
+    try {
+      await nextClient.connect(ctx?.signal);
+      connectionGate.assertCurrent(connectionGeneration);
+      if (client !== nextClient) {
+        throw new Error("Xcode MCP connection attempt was superseded or cancelled.");
+      }
+
+      nextClient.setToolsChangedHandler(() => queueToolCatalogRefresh(nextClient));
+      const count = await refreshToolCatalog(nextClient, ctx, connectionGeneration);
+      connectionGate.assertCurrent(connectionGeneration);
+      if (count === undefined || client !== nextClient) {
+        throw new Error("Xcode MCP connection attempt was superseded or cancelled.");
+      }
+
+      setStatus(ctx, `xcode mcp: ${count} tools`);
+      ctx?.ui.notify(`Connected to Xcode MCP (${count} tools).`, "info");
+    } catch (error) {
+      try {
+        await closeClient(nextClient);
+      } catch (cleanupError) {
+        throw new AggregateError(
+          [error, cleanupError],
+          "Xcode MCP connection failed and its bridge process could not be cleaned up.",
+        );
+      }
+      throw error;
+    }
+  }
+
+  function connect(ctx?: { ui: UiLike; cwd: string; signal?: AbortSignal }): Promise<void> {
+    let connectionGeneration: number;
+    try {
+      connectionGeneration = connectionGate.beginConnection();
+    } catch (error) {
+      return Promise.reject(error);
+    }
+
+    const operation = connectionQueue.enqueue(() => performConnect(connectionGeneration, ctx));
+    latestConnectPromise = operation;
+    const clearLatest = () => {
+      if (latestConnectPromise === operation) latestConnectPromise = undefined;
+    };
+    void operation.then(clearLatest, clearLatest);
+    return operation;
   }
 
   async function ensureConnected(ctx?: { ui: UiLike; cwd: string; signal?: AbortSignal }): Promise<StdioMcpClient> {
+    const pendingConnection = latestConnectPromise;
+    if (pendingConnection) await pendingConnection;
     if (client?.connected) return client;
 
-    if (!connectPromise) {
-      connectPromise = connect(ctx).finally(() => {
-        connectPromise = undefined;
-      });
-    }
-
-    await connectPromise;
-
+    await connect(ctx);
     if (!client?.connected) throw new Error("Failed to connect to Xcode MCP.");
     return client;
   }
 
   async function callXcodeTool(name: string, args: JsonObject, ctx: { ui: UiLike; cwd: string; signal?: AbortSignal }, onUpdate?: (partial: { content: PiContent[]; details: JsonObject }) => void) {
     const activeClient = await ensureConnected(ctx);
-    const mcpToolName = resolveMcpToolName(name);
+    const mcpToolName = toolCatalog.resolveMcpToolName(name);
     const resolvedArgs = await argumentsWithResolvedTabIdentifier(activeClient, mcpToolName, args, ctx);
 
     onUpdate?.({
@@ -1016,7 +1018,8 @@ export default function xcodeMcpExtension(pi: ExtensionAPI) {
       details: { mcpTool: mcpToolName, arguments: resolvedArgs },
     });
 
-    const result = await activeClient.callTool(mcpToolName, resolvedArgs, ctx.signal);
+    const timeoutMs = toolTimeoutMsForCall(mcpToolName, resolvedArgs, defaultToolTimeoutMs);
+    const result = await activeClient.callTool(mcpToolName, resolvedArgs, ctx.signal, timeoutMs);
     const content = mcpResultToPiContent(result);
     const isPreviewTool = mcpToolName === "RenderPreview";
     if (isPreviewTool) {
@@ -1036,10 +1039,10 @@ export default function xcodeMcpExtension(pi: ExtensionAPI) {
     onUpdate?: (partial: { content: PiContent[]; details: JsonObject }) => void,
   ) {
     const activeClient = await ensureConnected(ctx);
-    const renderPreviewToolName = findMcpToolName("RenderPreview", "XcodeRenderPreview");
+    const renderPreviewToolName = toolCatalog.findMcpToolName("RenderPreview", "XcodeRenderPreview");
 
     if (!renderPreviewToolName) {
-      throw new Error(`Xcode MCP did not advertise a SwiftUI preview render tool. Discovered tools:\n${toolLines().join("\n")}`);
+      throw new Error(`Xcode MCP did not advertise a SwiftUI preview render tool. Discovered tools:\n${toolCatalog.lines().join("\n")}`);
     }
 
     const renderArgs = await argumentsWithResolvedTabIdentifier(activeClient, renderPreviewToolName, params, ctx);
@@ -1049,7 +1052,8 @@ export default function xcodeMcpExtension(pi: ExtensionAPI) {
       details: { renderPreviewTool: renderPreviewToolName, arguments: renderArgs },
     });
 
-    const result = await activeClient.callTool(renderPreviewToolName, renderArgs, ctx.signal);
+    const timeoutMs = toolTimeoutMsForCall(renderPreviewToolName, renderArgs, defaultToolTimeoutMs);
+    const result = await activeClient.callTool(renderPreviewToolName, renderArgs, ctx.signal, timeoutMs);
     const content = mcpResultToPiContent(result);
     await appendPreviewSnapshotImages(content, result);
 
@@ -1066,10 +1070,10 @@ export default function xcodeMcpExtension(pi: ExtensionAPI) {
     onUpdate?: (partial: { content: PiContent[]; details: JsonObject }) => void,
   ) {
     const activeClient = await ensureConnected(ctx);
-    const buildToolName = findMcpToolName("BuildProject", "XcodeBuildProject");
+    const buildToolName = toolCatalog.findMcpToolName("BuildProject", "XcodeBuildProject", "XcodeBuild");
 
     if (!buildToolName) {
-      throw new Error(`Xcode MCP did not advertise a build tool. Discovered tools:\n${toolLines().join("\n")}`);
+      throw new Error(`Xcode MCP did not advertise a build tool. Discovered tools:\n${toolCatalog.lines().join("\n")}`);
     }
 
     const buildArgs = await argumentsWithResolvedTabIdentifier(activeClient, buildToolName, params.arguments ?? {}, ctx);
@@ -1108,7 +1112,7 @@ export default function xcodeMcpExtension(pi: ExtensionAPI) {
     const diagnosticBaseArgs: JsonObject = typeof buildArgs.tabIdentifier === "string" ? { tabIdentifier: buildArgs.tabIdentifier } : {};
 
     if (shouldFetchBuildLog) {
-      const buildLogToolName = findMcpToolName("GetBuildLog", "XcodeGetBuildLog");
+      const buildLogToolName = toolCatalog.findMcpToolName("GetBuildLog", "XcodeGetBuildLog");
       if (buildLogToolName) {
         const buildLogArgs = await argumentsWithResolvedTabIdentifier(activeClient, buildLogToolName, diagnosticBaseArgs, ctx);
 
@@ -1133,7 +1137,7 @@ export default function xcodeMcpExtension(pi: ExtensionAPI) {
     }
 
     if (buildFailed && includeNavigatorIssues) {
-      const navigatorIssuesToolName = findMcpToolName("XcodeListNavigatorIssues", "ListNavigatorIssues");
+      const navigatorIssuesToolName = toolCatalog.findMcpToolName("XcodeListNavigatorIssues", "ListNavigatorIssues");
       if (navigatorIssuesToolName) {
         const navigatorIssuesArgs = await argumentsWithResolvedTabIdentifier(activeClient, navigatorIssuesToolName, diagnosticBaseArgs, ctx);
 
@@ -1162,14 +1166,9 @@ export default function xcodeMcpExtension(pi: ExtensionAPI) {
     };
   }
 
-  function registerMcpTool(tool: McpTool): void {
-    const info = { piToolName: toPiToolName(tool.name), mcpToolName: tool.name, inputSchema: tool.inputSchema };
+  function registerMcpTool(entry: McpToolCatalogEntry): void {
+    const { info, tool } = entry;
     const piInputSchema = piInputSchemaWithAutoResolvedTabIdentifier(tool.inputSchema);
-    toolInfoByPiName.set(info.piToolName, info);
-    toolInfoByMcpName.set(info.mcpToolName, info);
-
-    if (registeredPiToolNames.has(info.piToolName)) return;
-    registeredPiToolNames.add(info.piToolName);
 
     pi.registerTool({
       name: info.piToolName,
@@ -1197,13 +1196,12 @@ export default function xcodeMcpExtension(pi: ExtensionAPI) {
     async execute(_toolCallId, _params, signal, _onUpdate, ctx) {
       await connect({ ui: ctx.ui, cwd: ctx.cwd, signal });
       return {
-        content: [{ type: "text", text: `Connected to Xcode MCP. Discovered tools:\n${toolLines().join("\n")}` }],
-        details: { tools: Array.from(toolInfoByPiName.values()) },
+        content: [{ type: "text", text: `Connected to Xcode MCP. Discovered tools:\n${toolCatalog.lines().join("\n")}` }],
+        details: { tools: toolCatalog.values() },
       };
     },
   });
 
-  registeredPiToolNames.add("xcode_render_preview");
   pi.registerTool({
     name: "xcode_render_preview",
     label: "Render SwiftUI Preview",
@@ -1292,7 +1290,7 @@ export default function xcodeMcpExtension(pi: ExtensionAPI) {
     handler: async (_args, ctx) => {
       try {
         await connect({ ui: ctx.ui, cwd: ctx.cwd, signal: ctx.signal });
-        ctx.ui.setWidget?.(STATUS_KEY, toolLines());
+        ctx.ui.setWidget?.(STATUS_KEY, toolCatalog.lines());
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         setStatus(ctx, "xcode mcp: offline");
@@ -1306,9 +1304,9 @@ export default function xcodeMcpExtension(pi: ExtensionAPI) {
     handler: async (_args, ctx) => {
       const lines = [
         `Connected: ${client?.connected ? "yes" : "no"}`,
-        `Discovered tools: ${toolInfoByPiName.size}`,
+        `Discovered tools: ${toolCatalog.size}`,
         `Bridge stderr: ${client?.lastStderr ? "see below" : "none"}`,
-        ...toolLines(),
+        ...toolCatalog.lines(),
       ];
 
       if (client?.lastStderr) {
@@ -1323,8 +1321,8 @@ export default function xcodeMcpExtension(pi: ExtensionAPI) {
   pi.registerCommand("xcode-mcp-list-tools", {
     description: "List mirrored Pi tools from Xcode MCP",
     handler: async (_args, ctx) => {
-      ctx.ui.setWidget?.(STATUS_KEY, toolLines());
-      ctx.ui.notify(`Listed ${toolInfoByPiName.size} Xcode MCP tools`, "info");
+      ctx.ui.setWidget?.(STATUS_KEY, toolCatalog.lines());
+      ctx.ui.notify(`Listed ${toolCatalog.size} Xcode MCP tools`, "info");
     },
   });
 
@@ -1338,6 +1336,9 @@ export default function xcodeMcpExtension(pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
-    await disconnect();
+    connectionGate.shutdown();
+    await closeCurrentClient();
+    await Promise.all([connectionQueue.onIdle(), toolRefreshQueue.onIdle()]);
+    await closeCurrentClient();
   });
 }

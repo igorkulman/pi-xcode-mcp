@@ -8,8 +8,9 @@ The primary goal is simple: **ask Pi to render a SwiftUI preview and inspect the
 
 - First-class `xcode_render_preview` tool for SwiftUI preview screenshots.
 - Automatically reads Xcode's `previewSnapshotPath` and attaches the image to Pi.
-- Automatically resolves Xcode's `tabIdentifier` from open Xcode windows whenever possible.
+- Resolves Xcode's `tabIdentifier` only when an open workspace matches Pi's current working directory.
 - Mirrors Xcode's native MCP tools into Pi as `xcode_*` tools.
+- Refreshes mirrored tools when Xcode reports that its MCP tool catalog changed.
 - Adds `xcode_build`, a convenience build wrapper that fetches logs and Issue Navigator diagnostics on failure.
 - Preserves MCP text, structured content, resources, and image results.
 
@@ -106,7 +107,7 @@ Common tools exposed by this package:
 | `xcode_read`, `xcode_update`, `xcode_grep`, `xcode_glob`, ... | Project-aware file operations through Xcode. |
 | `xcode_mcp_call` | Fallback for calling any Xcode MCP tool by MCP name. |
 
-Xcode MCP tools often require an Xcode `tabIdentifier`. This extension resolves it automatically from `XcodeListWindows`, preferring the Xcode window whose workspace path best matches Pi's current working directory. If multiple windows are ambiguous, pass `tabIdentifier` explicitly in tool arguments.
+Xcode MCP tools often require an Xcode `tabIdentifier`. This extension resolves it from `XcodeListWindows` only when one Xcode workspace path positively matches Pi's current working directory. If the current worktree is not open or multiple windows are ambiguous, the call fails with the available tabs instead of selecting an unrelated workspace. Open the intended worktree in Xcode or pass `tabIdentifier` explicitly in tool arguments.
 
 ## Commands
 
@@ -147,6 +148,16 @@ Manual connection is always available with:
 ```
 
 or by asking Pi to use `xcode_mcp_connect`.
+
+## Tool timeouts
+
+MCP tool calls default to a 10-minute client deadline. Connection and tool discovery keep their shorter 30-second deadline. Override the tool deadline with a positive integer in milliseconds when a project needs longer builds or test runs:
+
+```bash
+export XCODE_MCP_TOOL_TIMEOUT_MS=1200000
+```
+
+For `RenderPreview`, the extension automatically keeps the client deadline at least five seconds longer than the preview timeout requested from Xcode.
 
 ## Example workflows
 
@@ -213,9 +224,9 @@ Open the file in Xcode and make sure previews can render there. Large projects m
 
 `xcode_render_preview` reads the local file returned by Xcode MCP as `previewSnapshotPath` and attaches it as an image result. If the snapshot file has already been deleted or cannot be read, the tool result will include the snapshot path and the read error.
 
-### Multiple Xcode windows are open
+### Xcode workspace does not match the current worktree
 
-If Pi cannot choose a unique Xcode tab, the tool result will list the open `tabIdentifier` values. Re-run the tool with the correct `tabIdentifier`, or run Pi from the directory that matches the open Xcode workspace.
+The extension never selects a sole but unrelated Xcode window. Open the current worktree in Xcode and retry. If more than one matching tab exists, use `xcode_list_windows` and pass the intended `tabIdentifier` explicitly.
 
 ## Development
 
@@ -225,10 +236,13 @@ Install dependencies:
 npm install
 ```
 
-Type-check:
+Run the focused tests and type-check:
 
 ```bash
+npm test
 npm run typecheck
+# or both
+npm run check
 ```
 
 Try the package locally:
