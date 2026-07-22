@@ -38,6 +38,8 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
+    "test": "tsx --test tests/*.test.ts",
+    "check": "npm run typecheck && npm test",
     "prepack": "npm run typecheck"
   },
   "publishConfig": {
@@ -52,6 +54,7 @@
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@types/node": "^24.0.0",
+    "tsx": "^4.23.1",
     "typebox": "*",
     "typescript": "^5.9.3"
   }
