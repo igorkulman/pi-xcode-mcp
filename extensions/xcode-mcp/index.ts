@@ -59,6 +59,8 @@ type UiLike = {
   setWidget?(key: string, lines: string[]): void;
 };
 
+type HeadlessMcpServerState = "running" | "stopped" | "disabled" | "unavailable";
+
 const STATUS_KEY = "xcode-mcp";
 const CLIENT_NAME = "pi-xcode-mcp";
 const CLIENT_VERSION = "0.1.0";
@@ -264,6 +266,8 @@ function getPromptGuidelines(mcpToolName: string, piToolName: string): string[] 
       ];
     case "BuildProject":
       return [`Use ${piToolName} to build the active Xcode scheme when validating Swift or SwiftUI changes.`];
+    case "XcodeOpenWorkspace":
+      return [`Use ${piToolName} to open the project or workspace matching Pi's current directory when the headless Xcode MCP service has no active workspace.`];
     case "GetBuildLog":
       return [`Use ${piToolName} after BuildProject fails to inspect Xcode build errors and warnings.`];
     case "RunAllTests":
@@ -880,6 +884,16 @@ export default function xcodeMcpExtension(pi: ExtensionAPI) {
   const toolInfoByPiName = new Map<string, RegisteredToolInfo>();
   const toolInfoByMcpName = new Map<string, RegisteredToolInfo>();
 
+  async function headlessMcpServerState(): Promise<HeadlessMcpServerState> {
+    const result = await pi.exec("xcrun", ["mcp-server", "status"], { timeout: 3_000 });
+    if (result.code !== 0) return "unavailable";
+
+    const output = `${result.stdout}\n${result.stderr}`;
+    if (/^mcp-server:\s*running\s*$/im.test(output)) return "running";
+    if (/^Permission:\s*disabled\s*$/im.test(output)) return "disabled";
+    return "stopped";
+  }
+
   function setStatus(ctx: { ui: UiLike } | undefined, value: string | undefined): void {
     ctx?.ui.setStatus(STATUS_KEY, value);
   }
@@ -1223,11 +1237,11 @@ export default function xcodeMcpExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "xcode_build",
     label: "Xcode Build",
-    description: "Build the active Xcode scheme through Xcode MCP, then automatically fetch Xcode build errors and diagnostics when the build fails. This is usually faster and more project-aware than shelling out to xcodebuild because it uses the running Xcode instance.",
+    description: "Build the active Xcode scheme through Xcode MCP, then automatically fetch Xcode build errors and diagnostics when the build fails. This is usually faster and more project-aware than shelling out to xcodebuild because it uses the active Xcode workspace.",
     promptSnippet: "Build the active Xcode scheme through Xcode MCP and fetch errors on failure",
     promptGuidelines: [
       "Prefer xcode_build over shell xcodebuild when validating Swift, SwiftUI, or Xcode project changes and Xcode MCP is available.",
-      "Use xcode_build to build through the running Xcode instance and automatically retrieve GetBuildLog/Issue Navigator diagnostics on failure.",
+      "Use xcode_build to build through the active Xcode workspace and automatically retrieve GetBuildLog/Issue Navigator diagnostics on failure.",
       "Only fall back to shell xcodebuild when Xcode MCP is unavailable or the user explicitly asks for command-line xcodebuild.",
     ],
     parameters: BuildWithDiagnosticsParams,
@@ -1271,8 +1285,16 @@ export default function xcodeMcpExtension(pi: ExtensionAPI) {
 
     const xcodeProcess = await pi.exec("pgrep", ["-x", "Xcode"], { timeout: 1_000 });
     if (xcodeProcess.code !== 0) {
-      setStatus(ctx, "xcode mcp: Xcode closed");
-      return;
+      const headlessState = await headlessMcpServerState();
+      if (headlessState !== "running") {
+        const status = headlessState === "disabled"
+          ? "xcode mcp: headless disabled"
+          : headlessState === "stopped"
+            ? "xcode mcp: headless stopped"
+            : "xcode mcp: Xcode closed";
+        setStatus(ctx, status);
+        return;
+      }
     }
 
     try {
@@ -1281,7 +1303,7 @@ export default function xcodeMcpExtension(pi: ExtensionAPI) {
       const message = error instanceof Error ? error.message : String(error);
       setStatus(ctx, "xcode mcp: offline");
       ctx.ui.notify(
-        `Xcode MCP is offline. Open Xcode with a project, enable Settings > Intelligence > Model Context Protocol, approve the connection, then run /xcode-mcp-connect. (${message})`,
+        `Xcode MCP is offline. Open Xcode with a project, or enable and start Xcode 27's headless MCP service, then run /xcode-mcp-connect. (${message})`,
         "warning",
       );
     }

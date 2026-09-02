@@ -1,6 +1,6 @@
 # pi-xcode-mcp
 
-Connect [Pi](https://pi.dev) to **Xcode's built-in MCP server** so Pi can render SwiftUI previews, use Xcode project context, build and test through the running Xcode instance, inspect diagnostics, search Apple documentation, and run Swift snippets.
+Connect [Pi](https://pi.dev) to **Xcode's built-in MCP server** so Pi can render SwiftUI previews, use Xcode project context, build and test through either the Xcode app or Xcode 27's headless service, inspect diagnostics, search Apple documentation, and run Swift snippets.
 
 The primary goal is simple: **ask Pi to render a SwiftUI preview and inspect the actual screenshot**.
 
@@ -12,14 +12,15 @@ The primary goal is simple: **ask Pi to render a SwiftUI preview and inspect the
 - Mirrors Xcode's native MCP tools into Pi as `xcode_*` tools.
 - Adds `xcode_build`, a convenience build wrapper that fetches logs and Issue Navigator diagnostics on failure.
 - Preserves MCP text, structured content, resources, and image results.
+- Auto-connects to either a running Xcode app or Xcode 27's headless MCP service.
 
 ## Requirements
 
 - macOS
-- Xcode 26.3 or later
+- Xcode 26.3 or later for the app-based MCP server
+- Xcode 27 beta 5 or later for headless MCP
 - Pi installed
-- An Xcode project/workspace open in Xcode
-- Xcode MCP enabled in Xcode settings
+- Either an open Xcode project/workspace or a running headless MCP service
 
 Check that Apple's MCP bridge is available:
 
@@ -36,12 +37,36 @@ sudo xcodebuild -runFirstLaunch
 
 ## Enable Xcode MCP
 
+### Xcode app
+
 In Xcode:
 
 1. Open **Xcode > Settings > Intelligence**.
 2. Enable **Model Context Protocol / Xcode Tools**.
 3. Open your project or workspace in Xcode.
 4. When Xcode asks to allow the external MCP connection, click **Allow**.
+
+### Headless Xcode 27
+
+Xcode 27 beta 5 and later can expose the same tools without running the Xcode UI. Enabling the service changes a system permission and requires administrator approval; this extension never enables it or runs `sudo` automatically.
+
+Enable it once, then start it:
+
+```bash
+sudo xcrun mcp-server enable
+xcrun mcp-server start
+xcrun mcp-server status
+```
+
+Keep the default per-agent approval mode. Do not use `--unsafe-always-allow-all-agents` unless you understand that it grants every local process access to every reachable Xcode project.
+
+In headless mode, the first `XcodeOpenWorkspace` call asks you to approve the agent and project folder. The extension inherits `DEVELOPER_DIR`, so you can target an Xcode beta without changing the global `xcode-select` selection:
+
+```bash
+export DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer
+```
+
+The Xcode 27 command-line interface is still beta and may change.
 
 ## Installation
 
@@ -73,9 +98,10 @@ pi -e /absolute/path/to/pi-xcode-mcp
 
 ## Quick start: render a SwiftUI preview
 
-1. Open your app or package in Xcode.
+1. Open your app or package in Xcode, or start Xcode 27's headless MCP service.
 2. Open Pi from the same project/workspace directory.
-3. Ask Pi:
+3. In headless mode, ask Pi to open the project through Xcode MCP if it is not already active.
+4. Ask Pi:
 
 ```text
 Render the SwiftUI preview in DeviceListView and tell me what you see.
@@ -106,7 +132,7 @@ Common tools exposed by this package:
 | `xcode_read`, `xcode_update`, `xcode_grep`, `xcode_glob`, ... | Project-aware file operations through Xcode. |
 | `xcode_mcp_call` | Fallback for calling any Xcode MCP tool by MCP name. |
 
-Xcode MCP tools often require an Xcode `tabIdentifier`. This extension resolves it automatically from `XcodeListWindows`, preferring the Xcode window whose workspace path best matches Pi's current working directory. If multiple windows are ambiguous, pass `tabIdentifier` explicitly in tool arguments.
+Xcode MCP tools may require an Xcode `tabIdentifier`. For app-based sessions, this extension resolves it automatically from `XcodeListWindows`, preferring the Xcode window whose workspace path best matches Pi's current working directory. Xcode 27 headless tools can use the active workspace without a tab identifier; use the mirrored `xcode_open_workspace` tool first when no workspace is active.
 
 ## Commands
 
@@ -124,9 +150,9 @@ Inside Pi:
 By default, the extension auto-connects only when:
 
 - the current working directory looks like an Xcode project/workspace or Swift package, and
-- Xcode is already running.
+- either the Xcode app or Xcode 27's headless MCP service is already running.
 
-This avoids starting `xcrun mcpbridge` in unrelated projects.
+The extension checks `xcrun mcp-server status` only when Xcode is closed. It does not enable or start the headless service, and it avoids starting `xcrun mcpbridge` in unrelated projects.
 
 Force autoconnect everywhere:
 
@@ -164,7 +190,7 @@ Pi can call `xcode_render_preview`, receive the rendered image, and reason about
 Build the active Xcode scheme and summarize any errors.
 ```
 
-Pi can call `xcode_build`, which builds through the running Xcode instance, resolves the open Xcode tab automatically, and fetches `GetBuildLog` plus Issue Navigator diagnostics when the build fails. This is usually preferable to shell `xcodebuild` when Xcode MCP is available.
+Pi can call `xcode_build`, which builds through the active Xcode workspace, resolves an open Xcode tab when required, and fetches `GetBuildLog` plus Issue Navigator diagnostics when the build fails. This is usually preferable to shell `xcodebuild` when Xcode MCP is available.
 
 ### Search Apple docs
 
@@ -178,12 +204,19 @@ Pi can call `xcode_documentation_search`.
 
 ### No tools discovered
 
-Make sure:
+For the Xcode app, make sure:
 
-- Xcode is running.
-- A project/workspace is open in Xcode.
+- Xcode is running with a project/workspace open.
 - Xcode MCP is enabled in **Xcode > Settings > Intelligence**.
 - You allowed the MCP connection dialog.
+
+For headless Xcode 27, check:
+
+```bash
+xcrun mcp-server status
+```
+
+The output should report `Permission: enabled` and `mcp-server: running`. If no workspace is active after connecting, ask Pi to call `xcode_open_workspace` for the project or workspace in the current directory and approve the folder prompt.
 
 Then run:
 
@@ -261,7 +294,7 @@ pi install npm:pi-xcode-mcp
 
 ## Security
 
-Pi extensions run with your local user permissions. This extension starts Apple's `xcrun mcpbridge` and exposes Xcode's MCP tools to the active Pi model. Only use it with models and projects you trust.
+Pi extensions run with your local user permissions. This extension starts Apple's `xcrun mcpbridge` and exposes Xcode's MCP tools to the active Pi model. It detects but never enables or starts Xcode 27's headless service. Only use it with models and projects you trust, and prefer headless mode's per-agent and per-folder approvals over unsafe global access.
 
 ## License
 
