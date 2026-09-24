@@ -111,6 +111,28 @@ test("does not duplicate JSON text and equivalent structured content", () => {
   assert.doesNotMatch(content[0]?.type === "text" ? content[0].text : "", /Structured content/);
 });
 
+test("does not duplicate Xcode's structured message envelope", () => {
+  const message = "* workspaceIdentifier: workspace-live, workspacePath: /tmp/App.xcodeproj";
+  const content = mcpResultToPiContent({
+    content: [{ type: "text", text: message }],
+    structuredContent: { message },
+  });
+
+  assert.deepEqual(content, [{ type: "text", text: message }]);
+});
+
+test("preserves structured fields alongside a duplicate message", () => {
+  const message = "Active scheme is Debug";
+  const content = mcpResultToPiContent({
+    content: [{ type: "text", text: message }],
+    structuredContent: { message, activeScheme: "Debug" },
+  });
+
+  assert.equal(content.length, 2);
+  assert.match(content[1]?.type === "text" ? content[1].text : "", /activeScheme/);
+  assert.doesNotMatch(content[1]?.type === "text" ? content[1].text : "", /Active scheme is Debug/);
+});
+
 test("treats an all-not-run Xcode test result as a failure", () => {
   assert.equal(resultIndicatesTestFailure({
     structuredContent: {

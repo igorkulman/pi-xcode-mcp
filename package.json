@@ -1,6 +1,6 @@
 {
   "name": "pi-xcode-mcp",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Pi package that connects Pi to Xcode's built-in MCP server and exposes build, test, diagnostics, docs, and SwiftUI preview tools.",
   "license": "MIT",
   "type": "module",

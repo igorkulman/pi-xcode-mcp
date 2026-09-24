@@ -65,7 +65,7 @@ type HeadlessMcpServerState = "running" | "stopped" | "disabled" | "unavailable"
 
 const STATUS_KEY = "xcode-mcp";
 const CLIENT_NAME = "pi-xcode-mcp";
-const CLIENT_VERSION = "0.2.0";
+const CLIENT_VERSION = "0.3.0";
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 const DEFAULT_CONNECT_TIMEOUT_MS = 30_000;
 const DEFAULT_TOOL_TIMEOUT_MS = 120_000;
@@ -322,18 +322,27 @@ function contentBlockToPi(block: McpContent): PiContent[] {
   return [{ type: "text", text: truncateForModel(stringify(block)) }];
 }
 
-function contentAlreadyContainsStructuredValue(result: McpCallResult): boolean {
-  for (const item of result.content ?? []) {
-    if (item.type !== "text" || typeof item.text !== "string") continue;
+function structuredContentForDisplay(result: McpCallResult): unknown {
+  const textValues = (result.content ?? [])
+    .filter((item): item is McpContent & { type: "text"; text: string } => item.type === "text" && typeof item.text === "string")
+    .map((item) => item.text);
 
+  for (const text of textValues) {
     try {
-      if (isDeepStrictEqual(JSON.parse(item.text), result.structuredContent)) return true;
+      if (isDeepStrictEqual(JSON.parse(text), result.structuredContent)) return undefined;
     } catch {
       // The text block is not a JSON representation of the structured result.
     }
   }
 
-  return false;
+  if (isObject(result.structuredContent) &&
+      typeof result.structuredContent.message === "string" &&
+      textValues.includes(result.structuredContent.message)) {
+    const { message: _duplicateMessage, ...remainingStructuredContent } = result.structuredContent;
+    return Object.keys(remainingStructuredContent).length > 0 ? remainingStructuredContent : undefined;
+  }
+
+  return result.structuredContent;
 }
 
 export function mcpResultToPiContent(result: McpCallResult): PiContent[] {
@@ -343,8 +352,9 @@ export function mcpResultToPiContent(result: McpCallResult): PiContent[] {
     blocks.push(...contentBlockToPi(item));
   }
 
-  if (result.structuredContent !== undefined && !contentAlreadyContainsStructuredValue(result)) {
-    blocks.push({ type: "text", text: truncateForModel(`Structured content:\n${stringify(result.structuredContent)}`) });
+  const structuredContent = structuredContentForDisplay(result);
+  if (structuredContent !== undefined) {
+    blocks.push({ type: "text", text: truncateForModel(`Structured content:\n${stringify(structuredContent)}`) });
   }
 
   if (blocks.length === 0) {
