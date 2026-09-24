@@ -37,8 +37,9 @@
     ]
   },
   "scripts": {
+    "test": "rm -rf .test-build && tsc -p tsconfig.test.json && node --test .test-build/tests/*.test.js",
     "typecheck": "tsc --noEmit",
-    "prepack": "npm run typecheck"
+    "prepack": "npm run typecheck && npm test"
   },
   "publishConfig": {
     "access": "public"

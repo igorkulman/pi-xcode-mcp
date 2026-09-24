@@ -8,7 +8,7 @@ The primary goal is simple: **ask Pi to render a SwiftUI preview and inspect the
 
 - First-class `xcode_render_preview` tool for SwiftUI preview screenshots.
 - Automatically reads Xcode's `previewSnapshotPath` and attaches the image to Pi.
-- Automatically resolves Xcode's `tabIdentifier` from open Xcode windows whenever possible.
+- Automatically resolves Xcode 27 `workspaceIdentifier` values from the workspace matching Pi's current directory.
 - Mirrors Xcode's native MCP tools into Pi as `xcode_*` tools.
 - Adds `xcode_build`, a convenience build wrapper that fetches logs and Issue Navigator diagnostics on failure.
 - Preserves MCP text, structured content, resources, and image results.
@@ -17,8 +17,7 @@ The primary goal is simple: **ask Pi to render a SwiftUI preview and inspect the
 ## Requirements
 
 - macOS
-- Xcode 26.3 or later for the app-based MCP server
-- Xcode 27 beta 5 or later for headless MCP
+- Xcode 27 or later
 - Pi installed
 - Either an open Xcode project/workspace or a running headless MCP service
 
@@ -48,7 +47,7 @@ In Xcode:
 
 ### Headless Xcode 27
 
-Xcode 27 beta 5 and later can expose the same tools without running the Xcode UI. Enabling the service changes a system permission and requires administrator approval; this extension never enables it or runs `sudo` automatically.
+Xcode 27 can expose the same tools without running the Xcode UI. Enabling the service changes a system permission and requires administrator approval; this extension never enables it or runs `sudo` automatically.
 
 Enable it once, then start it:
 
@@ -60,13 +59,11 @@ xcrun mcp-server status
 
 Keep the default per-agent approval mode. Do not use `--unsafe-always-allow-all-agents` unless you understand that it grants every local process access to every reachable Xcode project.
 
-In headless mode, the first `XcodeOpenWorkspace` call asks you to approve the agent and project folder. The extension inherits `DEVELOPER_DIR`, so you can target an Xcode beta without changing the global `xcode-select` selection:
+In headless mode, the first `XcodeOpenWorkspace` call asks you to approve the agent and project folder. The extension inherits `DEVELOPER_DIR`, so you can target a non-default Xcode installation without changing the global `xcode-select` selection:
 
 ```bash
-export DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer
+export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
 ```
-
-The Xcode 27 command-line interface is still beta and may change.
 
 ## Installation
 
@@ -107,7 +104,7 @@ pi -e /absolute/path/to/pi-xcode-mcp
 Render the SwiftUI preview in DeviceListView and tell me what you see.
 ```
 
-Pi should use `xcode_render_preview`, resolve the open Xcode tab, call Xcode MCP's `RenderPreview`, read the generated preview image from `previewSnapshotPath`, and inspect the screenshot.
+Pi should use `xcode_render_preview`, resolve the matching Xcode workspace, call Xcode MCP's `RenderPreview`, read the generated preview image from `previewSnapshotPath`, and inspect the screenshot.
 
 If the view file has multiple previews, ask for a specific preview index:
 
@@ -130,9 +127,9 @@ Common tools exposed by this package:
 | `xcode_documentation_search` | Search Apple documentation and WWDC transcript context. |
 | `xcode_run_code_snippet` | Run Swift snippets in source-file context. |
 | `xcode_read`, `xcode_update`, `xcode_grep`, `xcode_glob`, ... | Project-aware file operations through Xcode. |
-| `xcode_mcp_call` | Fallback for calling any Xcode MCP tool by MCP name. |
+| `xcode_mcp_call` | Schema-validated fallback for calling any Xcode MCP tool by MCP name. |
 
-Xcode MCP tools may require an Xcode `tabIdentifier`. For app-based sessions, this extension resolves it automatically from `XcodeListWindows`, preferring the Xcode window whose workspace path best matches Pi's current working directory. Xcode 27 headless tools can use the active workspace without a tab identifier; use the mirrored `xcode_open_workspace` tool first when no workspace is active.
+The extension resolves `workspaceIdentifier` from Xcode 27's `XcodeListWorkspaces` in both app-based and headless sessions. It prefers the workspace path that best matches Pi's current working directory and reports ambiguity instead of choosing an unrelated workspace. Use the mirrored `xcode_open_workspace` tool first when no workspace is open.
 
 ## Commands
 
@@ -190,7 +187,7 @@ Pi can call `xcode_render_preview`, receive the rendered image, and reason about
 Build the active Xcode scheme and summarize any errors.
 ```
 
-Pi can call `xcode_build`, which builds through the active Xcode workspace, resolves an open Xcode tab when required, and fetches `GetBuildLog` plus Issue Navigator diagnostics when the build fails. This is usually preferable to shell `xcodebuild` when Xcode MCP is available.
+Pi can call `xcode_build`, which builds through the matching Xcode workspace, resolves its workspace identifier when required, and fetches `GetBuildLog` plus Issue Navigator diagnostics when the build fails. This is usually preferable to shell `xcodebuild` when Xcode MCP is available.
 
 ### Search Apple docs
 
@@ -246,9 +243,13 @@ Open the file in Xcode and make sure previews can render there. Large projects m
 
 `xcode_render_preview` reads the local file returned by Xcode MCP as `previewSnapshotPath` and attaches it as an image result. If the snapshot file has already been deleted or cannot be read, the tool result will include the snapshot path and the read error.
 
-### Multiple Xcode windows are open
+### Multiple Xcode workspaces are open
 
-If Pi cannot choose a unique Xcode tab, the tool result will list the open `tabIdentifier` values. Re-run the tool with the correct `tabIdentifier`, or run Pi from the directory that matches the open Xcode workspace.
+If Pi cannot choose a unique workspace, the tool result lists the open `workspaceIdentifier` values. Re-run the tool with the correct identifier, or run Pi from the directory that matches the intended Xcode workspace.
+
+### A generic MCP call has invalid arguments
+
+`xcode_mcp_call` validates arguments against the schema advertised by Xcode before invoking the tool. Prefer the specific mirrored `xcode_*` tool because its argument schema is visible directly to the model. Validation errors list required and supported argument names instead of forwarding guessed arguments to Xcode.
 
 ## Development
 
@@ -258,9 +259,10 @@ Install dependencies:
 npm install
 ```
 
-Type-check:
+Run tests and type-check:
 
 ```bash
+npm test
 npm run typecheck
 ```
 
