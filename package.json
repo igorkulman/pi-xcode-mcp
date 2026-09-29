@@ -1,7 +1,7 @@
 {
   "name": "pi-xcode-mcp",
-  "version": "0.3.0",
-  "description": "Pi package that connects Pi to Xcode's built-in MCP server and exposes build, test, diagnostics, docs, and SwiftUI preview tools.",
+  "version": "0.4.0",
+  "description": "Pi package that registers Xcode with Pi's native MCP client and adds SwiftUI preview, workspace, build, and diagnostics wrappers.",
   "license": "MIT",
   "type": "module",
   "engines": {
@@ -45,13 +45,11 @@
     "access": "public"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "typebox": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-coding-agent": "^0.99.0",
     "@types/node": "^24.0.0",
     "typebox": "*",
     "typescript": "^5.9.3"

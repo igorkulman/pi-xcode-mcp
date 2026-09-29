@@ -1,24 +1,27 @@
 # pi-xcode-mcp
 
-Connect [Pi](https://pi.dev) to **Xcode's built-in MCP server** so Pi can render SwiftUI previews, use Xcode project context, build and test through either the Xcode app or Xcode 27's headless service, inspect diagnostics, search Apple documentation, and run Swift snippets.
+Connect [Pi](https://pi.dev) to **Xcode's built-in MCP server** using Pi 0.99's native MCP client, with Xcode-specific wrappers for SwiftUI previews, workspace selection, builds, and diagnostics.
 
 The primary goal is simple: **ask Pi to render a SwiftUI preview and inspect the actual screenshot**.
 
-## Highlights
+## Why this package still exists
 
-- First-class `xcode_render_preview` tool for SwiftUI preview screenshots.
-- Automatically reads Xcode's `previewSnapshotPath` and attaches the image to Pi.
-- Automatically resolves Xcode 27 `workspaceIdentifier` values from the workspace matching Pi's current directory.
-- Mirrors Xcode's native MCP tools into Pi as `xcode_*` tools.
-- Adds `xcode_build`, a convenience build wrapper that fetches logs and Issue Navigator diagnostics on failure.
-- Preserves MCP text, structured content, resources, and image results.
-- Auto-connects to either a running Xcode app or Xcode 27's headless MCP service.
+Pi now owns the generic MCP transport and lifecycle. This package adds the Xcode-specific behavior that raw MCP configuration does not provide:
+
+- Registers `xcrun mcpbridge` through `pi.registerMcpServer()`.
+- Adds `xcode_render_preview`, which reads Xcode's `previewSnapshotPath` and attaches the image to Pi.
+- Automatically resolves `workspaceIdentifier` from the workspace matching Pi's current directory.
+- Adds `xcode_build`, which fetches build logs and, when Xcode advertises the tool, Issue Navigator diagnostics on failure.
+- Treats logical build, test, and preview failures as failed Pi tool results even when the MCP transport itself succeeded.
+- Keeps the raw Xcode MCP tools available through Pi's token-efficient `codemode` exposure.
+
+Pi's built-in `/mcp` interface handles connection status, errors, reconnecting, enabling, and disabling the server.
 
 ## Requirements
 
 - macOS
+- Pi 0.99.0 or later
 - Xcode 27 or later
-- Pi installed
 - Either an open Xcode project/workspace or a running headless MCP service
 
 Check that Apple's MCP bridge is available:
@@ -27,7 +30,7 @@ Check that Apple's MCP bridge is available:
 xcrun --find mcpbridge
 ```
 
-If this fails, make sure `xcode-select` points to the full Xcode app, not just Command Line Tools:
+If this fails, make sure `xcode-select` points to the full Xcode app rather than Command Line Tools:
 
 ```bash
 sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
@@ -38,8 +41,6 @@ sudo xcodebuild -runFirstLaunch
 
 ### Xcode app
 
-In Xcode:
-
 1. Open **Xcode > Settings > Intelligence**.
 2. Enable **Model Context Protocol / Xcode Tools**.
 3. Open your project or workspace in Xcode.
@@ -47,7 +48,7 @@ In Xcode:
 
 ### Headless Xcode 27
 
-Xcode 27 can expose the same tools without running the Xcode UI. Enabling the service changes a system permission and requires administrator approval; this extension never enables it or runs `sudo` automatically.
+Xcode 27 can expose the same tools without running the Xcode UI. Enabling the service changes a system permission and requires administrator approval; this package never enables it or runs `sudo` automatically.
 
 Enable it once, then start it:
 
@@ -59,7 +60,7 @@ xcrun mcp-server status
 
 Keep the default per-agent approval mode. Do not use `--unsafe-always-allow-all-agents` unless you understand that it grants every local process access to every reachable Xcode project.
 
-In headless mode, the first `XcodeOpenWorkspace` call asks you to approve the agent and project folder. The extension inherits `DEVELOPER_DIR`, so you can target a non-default Xcode installation without changing the global `xcode-select` selection:
+In headless mode, the first `XcodeOpenWorkspace` call asks you to approve the agent and project folder. The MCP server inherits `DEVELOPER_DIR`, so you can target a non-default Xcode installation:
 
 ```bash
 export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
@@ -67,11 +68,24 @@ export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
 
 ## Installation
 
-### Install from npm
+### Selected project only
+
+This is the recommended setup for selectively enabling Xcode MCP:
+
+```bash
+cd /path/to/project
+pi install -l npm:pi-xcode-mcp
+```
+
+The project-local Pi settings load the package only in that project. The package then registers its native MCP server for that session; a separate `.pi/mcp.json` entry is not required.
+
+### Global installation
 
 ```bash
 pi install npm:pi-xcode-mcp
 ```
+
+Use global installation only if you want Pi to attempt the Xcode MCP connection in every project where the package is loaded.
 
 If Pi is already running, reload resources:
 
@@ -93,20 +107,21 @@ pi install .
 pi -e /absolute/path/to/pi-xcode-mcp
 ```
 
-## Quick start: render a SwiftUI preview
+## Quick start
 
-1. Open your app or package in Xcode, or start Xcode 27's headless MCP service.
+1. Open your app or package in Xcode, or start Xcode's headless MCP service.
 2. Open Pi from the same project/workspace directory.
-3. In headless mode, ask Pi to open the project through Xcode MCP if it is not already active.
-4. Ask Pi:
+3. Run `/mcp` and confirm that the `xcode` server is connected.
+4. In headless mode, use the native `XcodeOpenWorkspace` MCP tool if no workspace is active.
+5. Ask Pi:
 
 ```text
 Render the SwiftUI preview in DeviceListView and tell me what you see.
 ```
 
-Pi should use `xcode_render_preview`, resolve the matching Xcode workspace, call Xcode MCP's `RenderPreview`, read the generated preview image from `previewSnapshotPath`, and inspect the screenshot.
+Pi uses `xcode_render_preview`, resolves the matching workspace, calls Xcode's native `RenderPreview` MCP tool, reads the generated snapshot, and inspects the attached image.
 
-If the view file has multiple previews, ask for a specific preview index:
+If the source file contains multiple previews:
 
 ```text
 Render preview index 1 in DeviceListView.
@@ -114,62 +129,28 @@ Render preview index 1 in DeviceListView.
 
 ## Tools
 
-Common tools exposed by this package:
+### Xcode-specific wrappers
 
 | Tool | Purpose |
 | --- | --- |
-| `xcode_render_preview` | Render a SwiftUI preview screenshot and return the image to Pi. |
-| `xcode_build` | Build through Xcode MCP and fetch build logs/diagnostics on failure. |
-| `xcode_build_project` | Direct mirror of Xcode MCP's `BuildProject`. |
-| `xcode_get_build_log` | Inspect Xcode build errors and warnings. |
-| `xcode_run_all_tests` / `xcode_run_some_tests` | Run tests through Xcode. |
-| `xcode_get_test_list` | Discover tests in the active scheme/test plan. |
-| `xcode_documentation_search` | Search Apple documentation and WWDC transcript context. |
-| `xcode_run_code_snippet` | Run Swift snippets in source-file context. |
-| `xcode_read`, `xcode_update`, `xcode_grep`, `xcode_glob`, ... | Project-aware file operations through Xcode. |
-| `xcode_mcp_call` | Schema-validated fallback for calling any Xcode MCP tool by MCP name. |
+| `xcode_render_preview` | Render a SwiftUI preview, resolve its workspace, and attach the screenshot. |
+| `xcode_build` | Build through Xcode MCP and fetch logs plus available Issue Navigator diagnostics on failure. |
+| `xcode_mcp_call` | Compatibility fallback that accepts an MCP name, native Pi tool name, or legacy `xcode_*` alias. |
 
-The extension resolves `workspaceIdentifier` from Xcode 27's `XcodeListWorkspaces` in both app-based and headless sessions. It prefers the workspace path that best matches Pi's current working directory and reports ambiguity instead of choosing an unrelated workspace. Use the mirrored `xcode_open_workspace` tool first when no workspace is open.
+### Native Xcode MCP tools
 
-## Commands
+Xcode's advertised tools are registered by Pi as `mcp__xcode__<tool>`, for example:
 
-Inside Pi:
+- `mcp__xcode__BuildProject`
+- `mcp__xcode__RunAllTests`
+- `mcp__xcode__RunSomeTests`
+- `mcp__xcode__DocumentationSearch`
+- `mcp__xcode__XcodeOpenWorkspace`
+- `mcp__xcode__XcodeListWorkspaces`
 
-```text
-/xcode-mcp-status
-/xcode-mcp-connect
-/xcode-mcp-list-tools
-/xcode-mcp-disconnect
-```
+They use `codemode` exposure by default, keeping the complete Xcode tool set out of the model's direct tool declarations while remaining callable by Pi and by this package's wrappers.
 
-## Autoconnect behavior
-
-By default, the extension auto-connects only when:
-
-- the current working directory looks like an Xcode project/workspace or Swift package, and
-- either the Xcode app or Xcode 27's headless MCP service is already running.
-
-The extension checks `xcrun mcp-server status` only when Xcode is closed. It does not enable or start the headless service, and it avoids starting `xcrun mcpbridge` in unrelated projects.
-
-Force autoconnect everywhere:
-
-```bash
-export XCODE_MCP_AUTOCONNECT=1
-```
-
-Disable autoconnect completely:
-
-```bash
-export XCODE_MCP_AUTOCONNECT=0
-```
-
-Manual connection is always available with:
-
-```text
-/xcode-mcp-connect
-```
-
-or by asking Pi to use `xcode_mcp_connect`.
+The available tools are determined by the installed Xcode version. Inspect them with `/mcp` rather than relying on a fixed package-maintained mirror.
 
 ## Example workflows
 
@@ -179,77 +160,69 @@ or by asking Pi to use `xcode_mcp_connect`.
 I changed DeviceListView. Render its SwiftUI preview and compare the screenshot with the expected layout.
 ```
 
-Pi can call `xcode_render_preview`, receive the rendered image, and reason about the actual UI instead of relying only on source code or build output.
-
 ### Build and inspect errors
 
 ```text
 Build the active Xcode scheme and summarize any errors.
 ```
 
-Pi can call `xcode_build`, which builds through the matching Xcode workspace, resolves its workspace identifier when required, and fetches `GetBuildLog` plus Issue Navigator diagnostics when the build fails. This is usually preferable to shell `xcodebuild` when Xcode MCP is available.
+`xcode_build` builds through the matching workspace and retrieves `GetBuildLog` plus Issue Navigator diagnostics when those tools are advertised by the installed Xcode version.
 
-### Search Apple docs
+### Search Apple documentation
 
 ```text
-Search Apple documentation for the current NavigationSplitView API.
+Use Xcode MCP to search Apple documentation for the current NavigationSplitView API.
 ```
 
-Pi can call `xcode_documentation_search`.
+Pi can call the native `DocumentationSearch` tool through `codemode`.
+
+## MCP management
+
+Use Pi's built-in interface:
+
+```text
+/mcp
+/mcp reconnect xcode
+```
+
+From the shell, project and global configured servers can be inspected with:
+
+```bash
+pi mcp list
+```
+
+The `xcode` server appears as extension-provided because this package registers it at runtime. Pi's shell command does not load extensions, so use `/mcp` inside a Pi session to inspect this package's registration.
+
+If a project `.pi/mcp.json` defines another server named `xcode`, that configured entry takes precedence over this package's registration.
 
 ## Troubleshooting
 
-### No tools discovered
+### The xcode server does not connect
 
-For the Xcode app, make sure:
-
-- Xcode is running with a project/workspace open.
-- Xcode MCP is enabled in **Xcode > Settings > Intelligence**.
-- You allowed the MCP connection dialog.
-
-For headless Xcode 27, check:
+Run `/mcp`, select `xcode`, and inspect the complete connection error. Also verify:
 
 ```bash
+xcrun --find mcpbridge
 xcrun mcp-server status
 ```
 
-The output should report `Permission: enabled` and `mcp-server: running`. If no workspace is active after connecting, ask Pi to call `xcode_open_workspace` for the project or workspace in the current directory and approve the folder prompt.
+For the Xcode app, make sure Xcode is running, the project is open, Xcode MCP is enabled under **Settings > Intelligence**, and the connection prompt was approved.
 
-Then run:
+### No workspace is open
 
-```text
-/xcode-mcp-connect
-```
-
-### `xcrun: error: unable to find utility "mcpbridge"`
-
-Your command-line tools are probably selected instead of the full Xcode app:
-
-```bash
-sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
-sudo xcodebuild -runFirstLaunch
-xcrun --find mcpbridge
-```
-
-### Xcode asks for permission repeatedly
-
-This is controlled by Xcode. Click **Allow** in the Xcode prompt. Future Xcode versions may improve this flow.
+Use Xcode's native `XcodeOpenWorkspace` MCP tool with the absolute project or workspace path. In headless mode, approve the folder when macOS asks.
 
 ### Preview rendering times out
 
-Open the file in Xcode and make sure previews can render there. Large projects may need a first build before previews become available through MCP.
+Open the file in Xcode and make sure its preview can render there. Large projects may need an initial build before previews become available through MCP. The package configures a 120-second MCP request timeout.
 
 ### Preview renders but Pi cannot see the screenshot
 
-`xcode_render_preview` reads the local file returned by Xcode MCP as `previewSnapshotPath` and attaches it as an image result. If the snapshot file has already been deleted or cannot be read, the tool result will include the snapshot path and the read error.
+`xcode_render_preview` reads the local `previewSnapshotPath` returned by Xcode and attaches it as an image. If Xcode removes the temporary file before it can be read, the result includes the path and read error.
 
 ### Multiple Xcode workspaces are open
 
-If Pi cannot choose a unique workspace, the tool result lists the open `workspaceIdentifier` values. Re-run the tool with the correct identifier, or run Pi from the directory that matches the intended Xcode workspace.
-
-### A generic MCP call has invalid arguments
-
-`xcode_mcp_call` validates arguments against the schema advertised by Xcode before invoking the tool. Prefer the specific mirrored `xcode_*` tool because its argument schema is visible directly to the model. Validation errors list required and supported argument names instead of forwarding guessed arguments to Xcode.
+The wrapper prefers the workspace path matching Pi's current directory. If it cannot choose uniquely, pass `workspaceIdentifier` explicitly or start Pi from the intended workspace directory.
 
 ## Development
 
@@ -266,10 +239,10 @@ npm test
 npm run typecheck
 ```
 
-Try the package locally:
+Try the package locally with Pi's built-in MCP support enabled:
 
 ```bash
-pi --no-extensions -e .
+pi --no-extensions -e builtin:mcp -e .
 ```
 
 Pack without publishing:
@@ -278,25 +251,11 @@ Pack without publishing:
 npm pack --dry-run
 ```
 
-## Publishing and pi.dev
-
-This package is discoverable by Pi's package gallery because `package.json` includes the `pi-package` keyword and a `pi` manifest.
-
-Publish to npm:
-
-```bash
-npm publish
-```
-
-Then users can install it with:
-
-```bash
-pi install npm:pi-xcode-mcp
-```
-
 ## Security
 
-Pi extensions run with your local user permissions. This extension starts Apple's `xcrun mcpbridge` and exposes Xcode's MCP tools to the active Pi model. It detects but never enables or starts Xcode 27's headless service. Only use it with models and projects you trust, and prefer headless mode's per-agent and per-folder approvals over unsafe global access.
+Pi extensions run with your local user permissions. This package asks Pi's native MCP client to start Apple's `xcrun mcpbridge`, and the active model can call tools exposed by Xcode. Only use it with models and projects you trust, and prefer headless mode's per-agent and per-folder approvals over unsafe global access.
+
+The package never enables or starts Xcode's headless service and never invokes `sudo`.
 
 ## License
 
