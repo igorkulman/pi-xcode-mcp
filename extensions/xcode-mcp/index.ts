@@ -688,6 +688,10 @@ async function buildWithDiagnostics(
 }
 
 export default function xcodeMcpExtension(pi: ExtensionAPI) {
+  if (typeof pi.registerMcpServer !== "function") {
+    throw new Error("pi-xcode-mcp 0.4.0 requires Pi 0.99.0 or later.");
+  }
+
   pi.registerMcpServer(MCP_SERVER_NAME, {
     command: "xcrun",
     args: ["mcpbridge"],

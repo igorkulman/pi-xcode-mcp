@@ -48,6 +48,18 @@ test("registers Xcode through Pi's native MCP client", () => {
   ]);
 });
 
+test("reports the minimum Pi version when native MCP is unavailable", () => {
+  const oldPi = {
+    registerTool() {},
+    on() {},
+  } as unknown as ExtensionAPI;
+
+  assert.throws(
+    () => xcodeMcpExtension(oldPi),
+    /requires Pi 0\.99\.0 or later/,
+  );
+});
+
 test("parses workspace identifiers from headless MCP text output", () => {
   const result = {
     content: [

@@ -2,6 +2,8 @@
 
 Connect [Pi](https://pi.dev) to **Xcode's built-in MCP server** using Pi 0.99's native MCP client, with Xcode-specific wrappers for SwiftUI previews, workspace selection, builds, and diagnostics.
 
+> **Requires Pi 0.99.0 or later.** Earlier Pi versions do not provide the native MCP APIs used by this package.
+
 The primary goal is simple: **ask Pi to render a SwiftUI preview and inspect the actual screenshot**.
 
 ## Why this package still exists
