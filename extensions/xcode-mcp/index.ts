@@ -1,5 +1,6 @@
-import { readFile } from "node:fs/promises";
-import { extname, resolve } from "node:path";
+import { readdir, readFile, stat } from "node:fs/promises";
+import { basename, dirname, extname, join, resolve } from "node:path";
+import { homedir } from "node:os";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -82,7 +83,16 @@ const BaseMcpCallParams = Type.Object({
   })),
 });
 
+const WorkspaceParam = Type.Optional(Type.String({
+  description: "Workspace identifier or .xcodeproj/.xcworkspace path. By default, reuse or open the project matching the current directory.",
+}));
+const SchemeParam = Type.Optional(Type.String({
+  description: "Scheme to select and verify before and after the operation. If omitted, check that the active scheme does not change.",
+}));
+
 const BuildWithDiagnosticsParams = Type.Object({
+  workspaceIdentifier: WorkspaceParam,
+  schemeName: SchemeParam,
   arguments: Type.Optional(Type.Record(Type.String(), Type.Any(), {
     description: "Optional arguments forwarded to Xcode MCP BuildProject.",
   })),
@@ -96,7 +106,18 @@ const BuildWithDiagnosticsParams = Type.Object({
   })),
 });
 
+const TestParams = Type.Object({
+  workspaceIdentifier: WorkspaceParam,
+  schemeName: SchemeParam,
+  testPlanName: Type.Optional(Type.String({ description: "Test plan to select and verify for this run." })),
+  tests: Type.Optional(Type.Array(Type.Object({
+    targetName: Type.String(),
+    testIdentifier: Type.String(),
+  }), { minItems: 1, description: "Tests discovered with GetTestList. Omit to run the active test plan." })),
+});
+
 const RenderPreviewParams = Type.Object({
+  schemeName: SchemeParam,
   sourceFilePath: Type.String({
     description: "Path to the SwiftUI source file within the Xcode project organization, e.g. ProjectName/Sources/MyView.swift.",
   }),
@@ -109,9 +130,7 @@ const RenderPreviewParams = Type.Object({
   timeout: Type.Optional(Type.Integer({
     description: "Seconds to wait for preview rendering. Defaults to Xcode MCP's timeout.",
   })),
-  workspaceIdentifier: Type.Optional(Type.String({
-    description: "Optional Xcode workspace identifier. Usually omitted because Pi resolves the workspace matching its current directory.",
-  })),
+  workspaceIdentifier: WorkspaceParam,
 });
 
 function isObject(value: unknown): value is JsonObject {
@@ -182,6 +201,7 @@ function mcpResultFromNestedResult(result: NestedToolResult, isError: boolean): 
 
   return {
     content: result.content.map((block) => ({ ...block })),
+    structuredContent: result.structuredContent,
     isError: isError || result.isError,
   };
 }
@@ -288,6 +308,7 @@ export function parseXcodeWorkspaces(result: McpCallResult): XcodeWorkspace[] {
   extractWorkspacesFromValue(result.structuredContent, workspaces);
 
   for (const text of collectStringsFromMcpResult(result)) {
+    try { extractWorkspacesFromValue(JSON.parse(text), workspaces); } catch { /* Also accept Xcode's plain text listing. */ }
     for (const line of text.split(/\r?\n/)) {
       const match = line.match(/workspaceIdentifier:\s*([^,\s]+)(?:,\s*workspacePath:\s*(.+))?/);
       if (match) {
@@ -351,10 +372,8 @@ export function selectXcodeWorkspace(workspaces: XcodeWorkspace[], cwd: string):
     score: scoreWorkspacePathForCwd(workspace.workspacePath, cwd),
   }));
   const bestScore = Math.max(...scored.map((item) => item.score));
-  const candidates = bestScore > 0
-    ? scored.filter((item) => item.score === bestScore).map((item) => item.workspace)
-    : workspaces;
-
+  if (bestScore === 0) return undefined;
+  const candidates = scored.filter((item) => item.score === bestScore).map((item) => item.workspace);
   return preferredWorkspaceForSamePath(candidates);
 }
 
@@ -364,14 +383,42 @@ function formatXcodeWorkspaces(workspaces: XcodeWorkspace[]): string {
     .join("\n");
 }
 
+export async function discoverXcodeWorkspace(cwd: string): Promise<string | undefined> {
+  let directory = resolve(cwd);
+  if (/\.(xcodeproj|xcworkspace)$/.test(directory)) return directory;
+
+  while (true) {
+    const entries = await readdir(directory, { withFileTypes: true });
+    const workspaces = entries.filter((entry) => entry.isDirectory() && entry.name.endsWith(".xcworkspace"));
+    const projects = entries.filter((entry) => entry.isDirectory() && entry.name.endsWith(".xcodeproj"));
+    const candidates = workspaces.length > 0 ? workspaces : projects;
+    if (candidates.length === 1) return join(directory, candidates[0].name);
+    if (candidates.length > 1) {
+      throw new Error(`Multiple Xcode projects/workspaces in ${directory}. Pass workspaceIdentifier with the desired project path.`);
+    }
+    // Do not escape a repository/worktree to open a neighbouring project.
+    if (entries.some((entry) => entry.name === ".git") || dirname(directory) === directory) return undefined;
+    directory = dirname(directory);
+  }
+}
+
+async function openXcodeWorkspace(ctx: ToolContext, path: string, onUpdate?: ToolUpdate): Promise<string> {
+  const call = await callNativeMcpTool(ctx, "XcodeOpenWorkspace", { path }, onUpdate);
+  if (call.isError) throw new Error(`Could not open ${path}: ${mcpResultText(call.protocolResult)}`);
+  const workspace = parseXcodeWorkspaces(call.protocolResult).find((item) =>
+    item.workspacePath === undefined || resolve(item.workspacePath) === resolve(path));
+  if (!workspace) throw new Error(`XcodeOpenWorkspace did not return a workspace identifier for ${path}.`);
+  return workspace.workspaceIdentifier;
+}
+
 async function resolveWorkspaceIdentifier(
   ctx: ToolContext,
   explicitIdentifier: unknown,
   onUpdate?: ToolUpdate,
 ): Promise<string> {
-  if (typeof explicitIdentifier === "string" && explicitIdentifier.trim()) {
-    return explicitIdentifier;
-  }
+  const explicit = typeof explicitIdentifier === "string" ? explicitIdentifier.trim() : undefined;
+  const explicitPath = explicit && /\.(xcodeproj|xcworkspace)$/.test(explicit) ? resolve(ctx.cwd, explicit) : undefined;
+  if (explicit && !explicitPath) return explicit;
 
   const listCall = await callNativeMcpTool(ctx, "XcodeListWorkspaces", {}, onUpdate);
   if (listCall.isError) {
@@ -379,19 +426,18 @@ async function resolveWorkspaceIdentifier(
   }
 
   const workspaces = parseXcodeWorkspaces(listCall.protocolResult);
-  const selected = selectXcodeWorkspace(workspaces, ctx.cwd);
+  const selected = explicitPath
+    ? preferredWorkspaceForSamePath(workspaces.filter((item) => item.workspacePath && resolve(item.workspacePath) === explicitPath))
+    : selectXcodeWorkspace(workspaces, ctx.cwd);
   if (selected) return selected.workspaceIdentifier;
 
-  if (workspaces.length === 0) {
-    throw new Error(
-      "Xcode MCP requires workspaceIdentifier, but no workspaces are open. " +
-      "Use the native XcodeOpenWorkspace MCP tool to open the project first.",
-    );
-  }
+  const path = explicitPath ?? await discoverXcodeWorkspace(ctx.cwd);
+  if (path) return openXcodeWorkspace(ctx, path, onUpdate);
 
   throw new Error(
-    `Xcode MCP requires workspaceIdentifier, but Pi could not choose a unique workspace for ${ctx.cwd}. ` +
-    `Pass workspaceIdentifier explicitly. Open workspaces:\n${formatXcodeWorkspaces(workspaces)}`,
+    `No matching Xcode workspace or unambiguous local project was found for ${ctx.cwd}. ` +
+    `Pass workspaceIdentifier explicitly (an identifier or .xcodeproj/.xcworkspace path). ` +
+    `The headless MCP service must already be running. Open workspaces:\n${formatXcodeWorkspaces(workspaces)}`,
   );
 }
 
@@ -403,8 +449,6 @@ async function argumentsWithResolvedWorkspace(
 ): Promise<JsonObject> {
   const tool = findNativeMcpTool(ctx, requestedName);
   if (!tool || !schemaHasArgument(tool.parameters, WORKSPACE_IDENTIFIER_ARGUMENT)) return args;
-  if (typeof args.workspaceIdentifier === "string" && args.workspaceIdentifier.trim()) return args;
-
   return {
     ...args,
     workspaceIdentifier: await resolveWorkspaceIdentifier(ctx, args.workspaceIdentifier, onUpdate),
@@ -499,6 +543,15 @@ function mcpResultText(result: McpCallResult): string {
   return parts.join("\n");
 }
 
+function resultData(result: McpCallResult): unknown {
+  if (result.structuredContent !== undefined) return result.structuredContent;
+  for (const item of result.content ?? []) {
+    if (item.type !== "text" || typeof item.text !== "string") continue;
+    try { return JSON.parse(item.text); } catch { /* Plain text is handled separately. */ }
+  }
+  return undefined;
+}
+
 function structuredContentIndicatesFailure(value: unknown): boolean {
   if (Array.isArray(value)) return value.some(structuredContentIndicatesFailure);
   if (!isObject(value)) return false;
@@ -508,7 +561,7 @@ function structuredContentIndicatesFailure(value: unknown): boolean {
     if (typeof child === "boolean" && child === false && ["success", "succeeded", "buildsucceeded", "passed"].includes(normalizedKey)) {
       return true;
     }
-    if (typeof child === "string" && /(status|state|result|outcome)/i.test(key) && /\b(failed|failure|error)\b/i.test(child)) {
+    if (typeof child === "string" && /(status|state|result|outcome)/i.test(key) && /\b(failed|failure|error|cancelled|canceled|aborted)\b/i.test(child)) {
       return true;
     }
     if (structuredContentIndicatesFailure(child)) return true;
@@ -517,10 +570,36 @@ function structuredContentIndicatesFailure(value: unknown): boolean {
   return false;
 }
 
+function operationStatusText(result: McpCallResult): string {
+  const parts: string[] = [];
+  for (const item of result.content ?? []) {
+    if (item.type !== "text" || typeof item.text !== "string") continue;
+    try { JSON.parse(item.text); } catch { parts.push(item.text); }
+  }
+  const data = resultData(result);
+  if (isObject(data)) {
+    for (const key of ["buildResult", "summary", "status", "result", "outcome", "error", "message", "data"]) {
+      if (typeof data[key] === "string") parts.push(data[key]);
+    }
+  }
+  return parts.join("\n");
+}
+
+function resultIndicatesCancellation(result: McpCallResult): boolean {
+  const cancelled = (value: unknown): boolean => {
+    if (Array.isArray(value)) return value.some(cancelled);
+    if (!isObject(value)) return false;
+    return Object.entries(value).some(([key, child]) =>
+      (typeof child === "string" && /(status|state|result|outcome)/i.test(key) && /\b(cancelled|canceled|aborted)\b/i.test(child)) || cancelled(child));
+  };
+  return cancelled(resultData(result)) ||
+    /\b(build(?: action)?|test(?: run)?|operation|request) (?:was |is )?(cancelled|canceled|aborted)\b|\b(cancelled|canceled|aborted) (build|test run)\b|^(cancelled|canceled|aborted)$/im.test(operationStatusText(result));
+}
+
 export function resultIndicatesBuildFailure(result: McpCallResult): boolean {
-  if (result.isError) return true;
-  if (structuredContentIndicatesFailure(result.structuredContent)) return true;
-  return /\b(build failed|failed to build|compilation failed|compile failed|link failed|fatal error:)\b|\berror:/i.test(mcpResultText(result));
+  if (result.isError || resultIndicatesCancellation(result)) return true;
+  if (structuredContentIndicatesFailure(resultData(result))) return true;
+  return /\b(build failed|build action failed|failed to build|compilation failed|compile failed|link failed|fatal error:)\b|\berror:/i.test(operationStatusText(result));
 }
 
 function findTestCounts(value: unknown): JsonObject | undefined {
@@ -544,17 +623,17 @@ function findTestCounts(value: unknown): JsonObject | undefined {
 }
 
 export function resultIndicatesTestFailure(result: McpCallResult): boolean {
-  if (result.isError) return true;
+  if (result.isError || resultIndicatesCancellation(result)) return true;
 
-  const counts = findTestCounts(result.structuredContent);
+  const counts = findTestCounts(resultData(result));
   if (counts) {
     const failed = typeof counts.failed === "number" ? counts.failed : 0;
     const total = typeof counts.total === "number" ? counts.total : 0;
     const notRun = typeof counts.notRun === "number" ? counts.notRun : 0;
-    if (failed > 0 || (total > 0 && notRun === total)) return true;
+    if (failed > 0 || total === 0 || notRun > 0) return true;
   }
 
-  return /\btests? failed\b|\btest run failed\b/i.test(mcpResultText(result));
+  return /\btests? failed\b|\btest run failed\b|\bbuild action failed\b|\bno tests (ran|were run)\b/i.test(operationStatusText(result));
 }
 
 function previewResultIndicatesFailure(result: McpCallResult): boolean {
@@ -571,7 +650,7 @@ function previewResultIndicatesFailure(result: McpCallResult): boolean {
     return false;
   };
 
-  return hasErrorsField(result.structuredContent);
+  return hasErrorsField(resultData(result));
 }
 
 function resultIndicatesToolFailure(mcpToolName: string, result: McpCallResult): boolean {
@@ -601,20 +680,83 @@ function sectionedContent(title: string, call: NativeMcpCall): PiContent[] {
   return blocks;
 }
 
+type WorkflowContext = { workspaceIdentifier?: string; schemeName?: string; testPlanName?: string };
+
+async function activeWorkflowContext(ctx: ToolContext, workspaceIdentifier: string | undefined): Promise<WorkflowContext> {
+  const context: WorkflowContext = { workspaceIdentifier };
+  const args = workspaceIdentifier ? { workspaceIdentifier } : {};
+  if (findNativeMcpTool(ctx, "XcodeListSchemes")) {
+    const call = await callNativeMcpTool(ctx, "XcodeListSchemes", args);
+    if (call.isError) throw new Error(`Cannot check the active scheme: ${mcpResultText(call.protocolResult)}`);
+    const data = resultData(call.protocolResult);
+    if (isObject(data) && typeof data.activeSchemeName === "string") context.schemeName = data.activeSchemeName;
+  }
+  if (findNativeMcpTool(ctx, "XcodeListTestPlans")) {
+    const call = await callNativeMcpTool(ctx, "XcodeListTestPlans", args);
+    if (call.isError) throw new Error(`Cannot check the active test plan: ${mcpResultText(call.protocolResult)}`);
+    const data = resultData(call.protocolResult);
+    if (isObject(data) && typeof data.activeTestPlanName === "string") context.testPlanName = data.activeTestPlanName;
+  }
+  return context;
+}
+
+async function prepareWorkflow(
+  ctx: ToolContext,
+  workspaceIdentifier: string | undefined,
+  schemeName?: string,
+  testPlanName?: string,
+): Promise<WorkflowContext> {
+  const args = workspaceIdentifier ? { workspaceIdentifier } : {};
+  for (const [name, field, value] of [
+    ["XcodeSwitchScheme", "schemeName", schemeName],
+    ["XcodeSwitchTestPlan", "testPlanName", testPlanName],
+  ] as const) {
+    if (!value) continue;
+    const call = await callNativeMcpTool(ctx, name, { ...args, [field]: value });
+    if (call.isError) throw new Error(`${name} failed: ${mcpResultText(call.protocolResult)}`);
+  }
+  const context = await activeWorkflowContext(ctx, workspaceIdentifier);
+  if (schemeName && context.schemeName !== schemeName) throw new Error(`Xcode did not select scheme '${schemeName}' (active: ${context.schemeName ?? "unknown"}).`);
+  const expectedPlan = testPlanName && basename(testPlanName).replace(/\.xctestplan$/, "");
+  if (expectedPlan && context.testPlanName !== expectedPlan) throw new Error(`Xcode did not select test plan '${testPlanName}' (active: ${context.testPlanName ?? "unknown"}).`);
+  return context;
+}
+
+async function workflowDrift(ctx: ToolContext, expected: WorkflowContext, result: McpCallResult): Promise<string[]> {
+  const actual = await activeWorkflowContext(ctx, expected.workspaceIdentifier);
+  const data = resultData(result);
+  const errors: string[] = [];
+  for (const key of ["schemeName", "testPlanName"] as const) {
+    const returnedKey = key === "testPlanName" ? "activeTestPlanName" : key;
+    if (expected[key] && actual[key] !== expected[key]) {
+      errors.push(`Xcode ${key} changed during the operation: ${expected[key]} → ${actual[key] ?? "unknown"}. Result is unverified; no automatic retry was performed.`);
+    }
+    if (expected[key] && isObject(data) && typeof data[returnedKey] === "string" && data[returnedKey] !== expected[key]) {
+      errors.push(`The returned result belongs to ${returnedKey} '${data[returnedKey]}', not '${expected[key]}'.`);
+    }
+  }
+  return errors;
+}
+
 async function renderPreview(
   params: JsonObject,
   ctx: ToolContext,
   onUpdate?: ToolUpdate,
 ) {
-  const renderArgs = await argumentsWithResolvedWorkspace(ctx, "RenderPreview", params, onUpdate);
+  const { schemeName, ...nativeParams } = params;
+  const renderArgs = await argumentsWithResolvedWorkspace(ctx, "RenderPreview", nativeParams, onUpdate);
+  const context = await prepareWorkflow(ctx, renderArgs.workspaceIdentifier as string | undefined, schemeName as string | undefined);
   const call = await callNativeMcpTool(ctx, "RenderPreview", renderArgs, onUpdate);
   const content = [...call.content];
   await appendPreviewSnapshotImages(content, call.protocolResult);
-  const failed = call.isError || previewResultIndicatesFailure(call.protocolResult);
+  const drift = await workflowDrift(ctx, context, call.protocolResult);
+  content.push(...drift.map((text) => ({ type: "text" as const, text })));
+  const failed = call.isError || previewResultIndicatesFailure(call.protocolResult) || drift.length > 0;
 
   return {
     content,
     details: {
+      workflowContext: context,
       mcpTool: call.mcpToolName,
       arguments: call.arguments,
       [XCODE_MCP_ERROR_DETAIL]: failed,
@@ -625,6 +767,8 @@ async function renderPreview(
 
 async function buildWithDiagnostics(
   params: {
+    workspaceIdentifier?: string;
+    schemeName?: string;
     arguments?: JsonObject;
     includeBuildLog?: "onFailure" | "always" | "never";
     includeNavigatorIssues?: boolean;
@@ -632,9 +776,12 @@ async function buildWithDiagnostics(
   ctx: ToolContext,
   onUpdate?: ToolUpdate,
 ) {
-  const buildArgs = await argumentsWithResolvedWorkspace(ctx, "BuildProject", params.arguments ?? {}, onUpdate);
+  const suppliedArgs = { ...params.arguments, ...(params.workspaceIdentifier ? { workspaceIdentifier: params.workspaceIdentifier } : {}) };
+  const buildArgs = await argumentsWithResolvedWorkspace(ctx, "BuildProject", suppliedArgs, onUpdate);
+  const context = await prepareWorkflow(ctx, buildArgs.workspaceIdentifier as string | undefined, params.schemeName);
   const buildCall = await callNativeMcpTool(ctx, "BuildProject", buildArgs, onUpdate);
-  const buildFailed = buildCall.isError || resultIndicatesBuildFailure(buildCall.protocolResult);
+  const drift = await workflowDrift(ctx, context, buildCall.protocolResult);
+  const buildFailed = buildCall.isError || resultIndicatesBuildFailure(buildCall.protocolResult) || drift.length > 0;
   const includeBuildLog = params.includeBuildLog ?? "onFailure";
   const includeNavigatorIssues = params.includeNavigatorIssues ?? true;
   const shouldFetchBuildLog = includeBuildLog === "always" || (includeBuildLog === "onFailure" && buildFailed);
@@ -646,8 +793,10 @@ async function buildWithDiagnostics(
         : "Xcode MCP build completed without detected build errors.",
     },
     ...sectionedContent("BuildProject", buildCall),
+    ...drift.map((text) => ({ type: "text" as const, text })),
   ];
   const details: JsonObject = {
+    workflowContext: context,
     buildTool: buildCall.mcpToolName,
     buildArguments: buildArgs,
     buildFailed,
@@ -683,6 +832,107 @@ async function buildWithDiagnostics(
   return {
     content,
     details,
+    ...(failed ? { isError: true } : {}),
+  };
+}
+
+type TestSpecifier = { targetName: string; testIdentifier: string };
+
+export async function verifyXcodeTestBundle(
+  reportedPath: string,
+  startedAt: number,
+  schemeName: string | undefined,
+  readSummary: (path: string) => Promise<JsonObject>,
+  derivedDataRoot = join(homedir(), "Library/Developer/Xcode/DerivedData"),
+): Promise<{ path: string; summary: JsonObject }> {
+  if (!reportedPath.endsWith(".xcresult")) throw new Error("Xcode did not return a .xcresult bundle path.");
+  const hasManifest = async (path: string) => {
+    try { return (await stat(join(path, "Info.plist"))).isFile(); } catch { return false; }
+  };
+  let paths = await hasManifest(reportedPath) ? [reportedPath] : [];
+  if (paths.length === 0) {
+    // Xcode 27 sometimes exports the bundle before Info.plist is finalized. Read the
+    // original with the same unique bundle name; never repair the exported copy.
+    const entries = await readdir(derivedDataRoot, { withFileTypes: true }).catch(() => []);
+    const originals = entries.filter((entry) => entry.isDirectory())
+      .map((entry) => join(derivedDataRoot, entry.name, "Logs/Test", basename(reportedPath)));
+    paths = (await Promise.all(originals.map(async (path) => await hasManifest(path) ? path : undefined)))
+      .filter((path): path is string => path !== undefined);
+  }
+  if (paths.length !== 1) throw new Error(`Cannot verify '${reportedPath}': no unique finalized result bundle. Xcode's exported copy may be incomplete.`);
+
+  const summary = await readSummary(paths[0]);
+  const startTime = typeof summary.startTime === "number" ? summary.startTime * 1000 : NaN;
+  const finishTime = typeof summary.finishTime === "number" ? summary.finishTime * 1000 : NaN;
+  if (!Number.isFinite(startTime) || startTime < startedAt - 2000 || startTime > Date.now() + 2000 ||
+      !Number.isFinite(finishTime) || finishTime < startTime || finishTime > Date.now() + 2000) {
+    throw new Error("The result bundle is stale or has no valid execution timestamps.");
+  }
+  if (schemeName && summary.title !== `Test - ${schemeName}`) throw new Error("The result bundle belongs to a different scheme.");
+  if (summary.result !== "Passed" || typeof summary.totalTestCount !== "number" || summary.totalTestCount <= 0 ||
+      summary.failedTests !== 0 || summary.skippedTests !== 0) {
+    throw new Error("The result bundle does not confirm a complete, successful test run.");
+  }
+  return { path: paths[0], summary };
+}
+
+async function runVerifiedTests(
+  params: { workspaceIdentifier?: string; schemeName?: string; testPlanName?: string; tests?: TestSpecifier[] },
+  ctx: ToolContext,
+  exec: ExtensionAPI["exec"],
+  onUpdate?: ToolUpdate,
+) {
+  const toolName = params.tests ? "RunSomeTests" : "RunAllTests";
+  const args = await argumentsWithResolvedWorkspace(ctx, toolName, {
+    ...(params.workspaceIdentifier ? { workspaceIdentifier: params.workspaceIdentifier } : {}),
+    ...(params.tests ? { tests: params.tests } : {}),
+  }, onUpdate);
+  const context = await prepareWorkflow(ctx, args.workspaceIdentifier as string | undefined, params.schemeName, params.testPlanName);
+  const startedAt = Date.now();
+  const call = await callNativeMcpTool(ctx, toolName, args, onUpdate);
+  const data = resultData(call.protocolResult);
+  const errors = await workflowDrift(ctx, context, call.protocolResult);
+  const counts = findTestCounts(data);
+  if (call.isError || resultIndicatesTestFailure(call.protocolResult)) errors.push("Xcode reported a failed, cancelled, empty, or incomplete test run.");
+  if (!counts || typeof counts.total !== "number" || counts.total <= 0) errors.push("Xcode returned no executed-test counts.");
+  if (params.tests) {
+    const results = isObject(data) && Array.isArray(data.results) ? data.results : [];
+    for (const test of params.tests) {
+      const matches = results.filter((result) => isObject(result) && result.targetName === test.targetName &&
+        typeof result.identifier === "string" && (result.identifier === test.testIdentifier || result.identifier.startsWith(`${test.testIdentifier}/`)));
+      if (matches.length === 0 || matches.some((result) => !isObject(result) || !/^(passed|expected failure)$/i.test(String(result.state)))) {
+        errors.push(`Requested test was not confirmed successful: ${test.targetName}/${test.testIdentifier}.`);
+      }
+    }
+  }
+  let bundle: { path: string; summary: JsonObject } | undefined;
+  if (errors.length === 0) {
+    try {
+      if (!isObject(data) || typeof data.xcresultBundlePath !== "string") throw new Error("Xcode returned no result bundle path.");
+      bundle = await verifyXcodeTestBundle(data.xcresultBundlePath, startedAt, context.schemeName, async (path) => {
+        const result = await exec("xcrun", ["xcresulttool", "get", "test-results", "summary", "--path", path], { signal: ctx.signal, timeout: 30_000 });
+        if (result.code !== 0) throw new Error(`Cannot read the result bundle: ${result.stderr}`);
+        const summary: unknown = JSON.parse(result.stdout);
+        if (!isObject(summary)) throw new Error("Invalid xcresulttool summary.");
+        return summary;
+      });
+    } catch (error) {
+      errors.push(error instanceof Error ? error.message : String(error));
+    }
+  }
+  const failed = errors.length > 0;
+  const content: PiContent[] = [{ type: "text", text: failed
+    ? `Xcode test run is not verified:\n${errors.join("\n")}`
+    : `Verified ${bundle!.summary.totalTestCount} tests for ${context.schemeName ?? "the active scheme"}: passed, no failures or skips.\nResult bundle: ${bundle!.path}` }];
+  if (isObject(data) && typeof data.fullSummaryPath === "string") content.push({ type: "text", text: `Xcode summary: ${data.fullSummaryPath}` });
+  if (failed && findNativeMcpTool(ctx, "GetBuildLog")) {
+    const log = await callNativeMcpTool(ctx, "GetBuildLog", context.workspaceIdentifier ? { workspaceIdentifier: context.workspaceIdentifier } : {});
+    content.push(...sectionedContent("GetBuildLog", log));
+  }
+  return {
+    content,
+    structuredContent: JSON.parse(JSON.stringify({ nativeResult: data, workflowContext: context, verified: !failed, verificationErrors: errors, verifiedBundlePath: bundle?.path })),
+    details: { workflowContext: context, verificationErrors: errors, [XCODE_MCP_ERROR_DETAIL]: failed },
     ...(failed ? { isError: true } : {}),
   };
 }
@@ -728,6 +978,22 @@ export default function xcodeMcpExtension(pi: ExtensionAPI) {
     parameters: BuildWithDiagnosticsParams,
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       return buildWithDiagnostics(params, toolContextWithSignal(ctx, signal), onUpdate as ToolUpdate | undefined);
+    },
+  });
+
+  pi.registerTool({
+    name: "xcode_test",
+    label: "Xcode Test",
+    description: "Run selected tests or the active test plan, auto-open the matching project, verify scheme/test-plan stability and requested coverage, and confirm execution using a fresh readable xcresult bundle.",
+    promptSnippet: "Run and verify Xcode tests, including headless workspaces",
+    promptGuidelines: [
+      "Prefer xcode_test for test verification. Pass schemeName and testPlanName when the task requires specific ones.",
+      "xcode_test never retries automatically or reports an empty, cancelled, incomplete, stale, or wrong-scheme run as verified.",
+    ],
+    parameters: TestParams,
+    outputSchema: Type.Record(Type.String(), Type.Any()),
+    async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      return runVerifiedTests(params, toolContextWithSignal(ctx, signal), pi.exec.bind(pi), onUpdate as ToolUpdate | undefined);
     },
   });
 

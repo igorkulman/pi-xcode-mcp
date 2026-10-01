@@ -12,8 +12,10 @@ Pi now owns the generic MCP transport and lifecycle. This package adds the Xcode
 
 - Registers `xcrun mcpbridge` through `pi.registerMcpServer()`.
 - Adds `xcode_render_preview`, which reads Xcode's `previewSnapshotPath` and attaches the image to Pi.
-- Automatically resolves `workspaceIdentifier` from the workspace matching Pi's current directory.
+- Automatically resolves `workspaceIdentifier` from the workspace matching Pi's current directory, or opens an unambiguous local project through the headless service. Never selects an unrelated open project.
 - Adds `xcode_build`, which fetches build logs and, when Xcode advertises the tool, Issue Navigator diagnostics on failure.
+- Adds `xcode_test`, which verifies requested-test coverage and a fresh, readable result bundle instead of trusting transport success alone.
+- Checks the active scheme/test plan before and after builds, tests, and previews, and reports unexpected changes without automatically rerunning the operation.
 - Treats logical build, test, and preview failures as failed Pi tool results even when the MCP transport itself succeeded.
 - Keeps the raw Xcode MCP tools available through Pi's token-efficient `codemode` exposure.
 
@@ -114,7 +116,7 @@ pi -e /absolute/path/to/pi-xcode-mcp
 1. Open your app or package in Xcode, or start Xcode's headless MCP service.
 2. Open Pi from the same project/workspace directory.
 3. Run `/mcp` and confirm that the `xcode` server is connected.
-4. In headless mode, use the native `XcodeOpenWorkspace` MCP tool if no workspace is active.
+4. No project needs to be open in the Xcode UI when the headless service is running. The wrappers reuse a matching workspace or open the nearest unambiguous `.xcworkspace`/`.xcodeproj` automatically. Approve the project folder if macOS asks.
 5. Ask Pi:
 
 ```text
@@ -136,7 +138,8 @@ Render preview index 1 in DeviceListView.
 | Tool | Purpose |
 | --- | --- |
 | `xcode_render_preview` | Render a SwiftUI preview, resolve its workspace, and attach the screenshot. |
-| `xcode_build` | Build through Xcode MCP and fetch logs plus available Issue Navigator diagnostics on failure. |
+| `xcode_build` | Build through Xcode MCP, check scheme stability, and fetch diagnostics on failure. |
+| `xcode_test` | Run selected tests or the active plan, verify workflow context and execution, and reject incomplete or stale results. |
 | `xcode_mcp_call` | Compatibility fallback that accepts an MCP name, native Pi tool name, or legacy `xcode_*` alias. |
 
 ### Native Xcode MCP tools
@@ -168,7 +171,19 @@ I changed DeviceListView. Render its SwiftUI preview and compare the screenshot 
 Build the active Xcode scheme and summarize any errors.
 ```
 
-`xcode_build` builds through the matching workspace and retrieves `GetBuildLog` plus Issue Navigator diagnostics when those tools are advertised by the installed Xcode version.
+`xcode_build` builds through the matching workspace and retrieves `GetBuildLog` plus Issue Navigator diagnostics when those tools are advertised by the installed Xcode version. Its optional `schemeName` selects the requested scheme before the build; otherwise the current scheme is used. The active scheme is checked again afterward when Xcode advertises scheme-inspection tools.
+
+### Run verified tests
+
+```text
+Run SeatFamilyProductRemovalTests using scheme Debug - Evenflo and test plan EvenfloSensorSafe.
+```
+
+Use `xcode_test` with optional `schemeName`, `testPlanName`, and `workspaceIdentifier`. Supply `tests: [{ targetName, testIdentifier }]` using identifiers from `GetTestList`, or omit `tests` to run the active plan.
+
+The wrapper rejects failed, cancelled, empty, partially unexecuted, skipped, stale, wrong-context, or missing-requested-test runs. It reads the result bundle with `xcrun xcresulttool`; this inspects results and never reruns tests through shell `xcodebuild`. No automatic retry occurs.
+
+Xcode 27 sometimes exports an unfinished `.xcresult` copy without `Info.plist`. When this happens, the wrapper looks for a unique finalized original with the identical bundle name under `~/Library/Developer/Xcode/DerivedData`, then verifies its scheme and execution timestamps. It never repairs the exported copy. If the original cannot be identified or read (including custom DerivedData locations), the run is reported as unverified rather than successful.
 
 ### Search Apple documentation
 
@@ -212,7 +227,9 @@ For the Xcode app, make sure Xcode is running, the project is open, Xcode MCP is
 
 ### No workspace is open
 
-Use Xcode's native `XcodeOpenWorkspace` MCP tool with the absolute project or workspace path. In headless mode, approve the folder when macOS asks.
+With the headless service already running, the wrappers find the nearest unambiguous local project and call `XcodeOpenWorkspace` automatically; the Xcode UI does not need an open project. Discovery stops at a repository/worktree boundary and prefers a single `.xcworkspace` over `.xcodeproj` directories. If several candidates exist, pass `workspaceIdentifier` with the desired project/workspace path. Native MCP calls made directly still require their workspace context.
+
+The extension does not enable or start the headless service, grant folder permissions, or invoke `sudo`.
 
 ### Preview rendering times out
 
@@ -224,7 +241,11 @@ Open the file in Xcode and make sure its preview can render there. Large project
 
 ### Multiple Xcode workspaces are open
 
-The wrapper prefers the workspace path matching Pi's current directory. If it cannot choose uniquely, pass `workspaceIdentifier` explicitly or start Pi from the intended workspace directory.
+The wrapper prefers the workspace path matching Pi's current directory and prefers its headless identifier when both headless and UI entries exist. It never falls back to a sole unrelated project. You can pass `workspaceIdentifier` as an identifier or a `.xcodeproj`/`.xcworkspace` path; paths are resolved to an existing identifier or opened through MCP.
+
+### Scheme unexpectedly changes
+
+Pass `schemeName` to `xcode_build`, `xcode_test`, or `xcode_render_preview`, and `testPlanName` to `xcode_test` when a specific plan is required. The wrappers select that context immediately before execution and check it afterward. Results from another scheme/plan, or changes during execution, are flagged as unverified. Inspect the recorded `workflowContext` and Xcode logs instead of treating a successful transport response as proof of the intended build or test run.
 
 ## Development
 
