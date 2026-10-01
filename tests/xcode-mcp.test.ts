@@ -45,6 +45,7 @@ test("registers Xcode through Pi's native MCP client", () => {
     "xcode_build",
     "xcode_mcp_call",
     "xcode_render_preview",
+    "xcode_test",
   ]);
 });
 
